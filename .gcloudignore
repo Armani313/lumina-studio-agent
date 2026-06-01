@@ -1,0 +1,14 @@
+# Keep the Cloud Run source upload small. (.env is NOT used — env comes via --set-env-vars.)
+.venv/
+__pycache__/
+*.pyc
+outputs/
+*.png
+*.jpg
+*.mp4
+.git/
+.env
+test_remote.py
+run_slice.py
+marketplace/smoke_test.py
+marketplace/a2a_server.py

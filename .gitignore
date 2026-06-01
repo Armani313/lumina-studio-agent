@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.claude/
+outputs/
+*.png
+*.mp4
+.DS_Store
+
+# committed assets (exceptions to the *.png rule above)
+!assets/sample_product.png
+!docs/architecture.png

@@ -1,0 +1,19 @@
+# Core agent
+google-adk==2.1.0
+google-genai==1.75.0
+google-cloud-storage==3.10.1
+pillow==12.2.0
+python-dotenv==1.2.2
+
+# Grounding RAG + marketplace state
+google-cloud-firestore==2.27.0
+
+# A2A interop (ADK pins a2a-sdk>=0.3.4,<0.4; 1.x is incompatible)
+a2a-sdk==0.3.26
+sse-starlette==3.4.4
+
+# Marketplace web service
+fastapi==0.136.3
+uvicorn==0.48.0
+python-multipart==0.0.30
+httpx==0.28.1

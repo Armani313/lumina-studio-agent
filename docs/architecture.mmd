@@ -1,0 +1,36 @@
+flowchart TD
+  U(["Product photo + brief"]) --> ROOT
+  subgraph ROOT["SequentialAgent: lumina_pipeline"]
+    direction TB
+    INT["intake LlmAgent<br/>output_schema CreativeBrief"] --> GND
+    subgraph GND["ParallelAgent: grounding"]
+      direction LR
+      RES["brand_research<br/>tool google_search"]
+      RAG["brand_rag<br/>tool VertexAiSearchTool"]
+    end
+    GND --> PLAN["shot_planner LlmAgent<br/>output_schema ShotPlan, N shots"]
+    PLAN --> PROD
+    subgraph PROD["ParallelAgent: production"]
+      direction LR
+      IMG["image_production xN<br/>generate_lifestyle_image<br/>image-conditioned on product"]
+      COPY["copywriter<br/>generate_copy"]
+      VID["video_production<br/>generate_product_video, Veo"]
+    end
+    PROD --> CARD["card_production LlmAgent<br/>make_product_card x2"]
+    CARD --> QA
+    subgraph QA["LoopAgent: qa_loop, max 2"]
+      BQA["brand_qa LlmAgent<br/>review fidelity and brand,<br/>regenerate, exit_loop"]
+    end
+    QA --> DEL["delivery LlmAgent<br/>write_manifest"]
+  end
+
+  RES -. "google_search" .-> WEB(("Web"))
+  RAG -. "retrieve" .-> VS[("Vertex AI Search:<br/>aurelia-brand-kb")]
+  IMG -- "images" --> GCS[("Cloud Storage")]
+  CARD -- "cards" --> GCS
+  VID -- "video" --> GCS
+  BQA -. "read and compare" .-> GCS
+  DEL -- "manifest" --> GCS
+  INT -. "Gemini 3.x, global" .-> VX[("Vertex / Gemini Enterprise<br/>Agent Platform")]
+  IMG -. "Nano Banana, global" .-> VX
+  VID -. "Veo, us-central1" .-> VX

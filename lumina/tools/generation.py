@@ -1,0 +1,137 @@
+"""Generation tools: marketing copy + on-brand lifestyle image.
+
+generate_lifestyle_image is **image-conditioned**: if a product reference photo is present in
+session state (`product_image_uri`), the generated scene depicts that exact product (preserving
+shape, label, color), rather than inventing one. Falls back to text->image when absent.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import uuid
+
+from google.adk.tools import ToolContext
+from google.genai import errors as genai_errors
+from google.genai import types
+
+from ..clients import gemini_client
+from ..config import settings
+from .delivery import mime_for_uri, public_https_url, upload_bytes
+
+# Image generation has a tight per-minute quota; cap concurrency and retry transient 429/503.
+_IMG_SEM = threading.Semaphore(int(os.getenv("IMAGE_CONCURRENCY", "3")))
+
+
+def _image_generate_with_retry(contents, config, attempts: int = 5):
+    delay = 8.0
+    for i in range(attempts):
+        try:
+            with _IMG_SEM:
+                return gemini_client().models.generate_content(
+                    model=settings.model_image, contents=contents, config=config
+                )
+        except genai_errors.APIError as e:
+            transient = getattr(e, "code", None) in (429, 503, 500) or "RESOURCE_EXHAUSTED" in str(e)
+            if transient and i < attempts - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
+
+
+def generate_copy(product_name: str, key_features: str, brand_voice: str, channel: str) -> dict:
+    """Generate channel-ready marketing copy for a product, in the brand's voice.
+
+    Args:
+        product_name: The product's name.
+        key_features: Comma-separated key features/benefits.
+        brand_voice: Short description of brand tone (e.g. 'minimalist, premium, calm').
+        channel: Target channel: 'amazon', 'instagram', or 'website'.
+
+    Returns:
+        A dict with keys: title, short, detailed, bullets.
+    """
+    prompt = (
+        f"You are a senior DTC copywriter. Write {channel} product copy.\n"
+        f"Brand voice: {brand_voice}\n"
+        f"Product: {product_name}\n"
+        f"Key features: {key_features}\n"
+        "Return STRICT JSON with keys: title (<=60 chars), short (<=160 chars), "
+        "detailed (2-3 sentences), bullets (array of 3-5 short strings)."
+    )
+    resp = gemini_client().models.generate_content(
+        model=settings.model_reasoning,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            max_output_tokens=2048,  # gemini-3.x flash is a thinking model — leave headroom
+        ),
+    )
+    try:
+        return json.loads(resp.text)
+    except Exception:
+        return {"raw": resp.text}
+
+
+def render_image_bytes(
+    scene_description: str, aspect_ratio: str = "1:1", product_uri: str | None = None
+):
+    """Generate one image and return (bytes, mime), or None. Image-conditioned on product_uri
+    when given. Shared by generate_lifestyle_image and the product-card tool."""
+    contents: list = []
+    if product_uri:
+        contents.append(types.Part.from_uri(file_uri=product_uri, mime_type=mime_for_uri(product_uri)))
+        instruction = (
+            "Use the attached reference photo as the EXACT product — preserve its silhouette, "
+            "label text, colors and proportions precisely. Place that same product into a new, "
+            f"photorealistic, commercial-quality on-brand scene: {scene_description}. "
+            "Natural lighting, high detail, no added text overlays, no watermarks."
+        )
+    else:
+        instruction = (
+            "Professional, photorealistic, commercial-quality on-brand product photograph. "
+            f"{scene_description}. Natural lighting, high detail, no text overlays, no watermarks."
+        )
+    contents.append(types.Part(text=instruction))
+
+    resp = _image_generate_with_retry(
+        contents,
+        types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+        ),
+    )
+    for cand in resp.candidates or []:
+        for part in (cand.content.parts or []):
+            inline = getattr(part, "inline_data", None)
+            if inline and inline.data:
+                return inline.data, (inline.mime_type or "image/png")
+    return None
+
+
+def generate_lifestyle_image(
+    scene_description: str, aspect_ratio: str = "1:1", tool_context: ToolContext = None
+) -> dict:
+    """Generate an on-brand photorealistic lifestyle image and store it in GCS.
+
+    If a product reference photo exists in session state, the SAME product is depicted in the
+    new scene (image-conditioned generation for product fidelity).
+
+    Args:
+        scene_description: Vivid description of the scene/setting and product placement.
+        aspect_ratio: One of '1:1', '4:5', '9:16', '16:9'.
+
+    Returns:
+        A dict with 'gs_uri' and 'https_url' of the stored image, or 'error'.
+    """
+    product_uri = tool_context.state.get("product_image_uri") if tool_context else None
+    out = render_image_bytes(scene_description, aspect_ratio, product_uri)
+    if not out:
+        return {"error": "no image part returned"}
+    data, mime = out
+    ext = "png" if "png" in mime else "jpg"
+    blob_name = f"images/{uuid.uuid4().hex}.{ext}"
+    gs_uri = upload_bytes(data, blob_name, mime)
+    return {"gs_uri": gs_uri, "https_url": public_https_url(gs_uri), "mime": mime}

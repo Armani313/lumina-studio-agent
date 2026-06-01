@@ -1,0 +1,7 @@
+# Runtime deps for the Agent Engine deployment (only what lumina/ imports).
+# The marketplace (fastapi/a2a-sdk/firestore/etc.) is deployed separately to Cloud Run.
+google-adk==2.1.0
+google-genai==1.75.0
+google-cloud-storage==3.10.1
+pillow==12.2.0
+python-dotenv==1.2.2
