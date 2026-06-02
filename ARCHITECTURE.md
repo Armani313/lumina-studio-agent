@@ -82,8 +82,9 @@ Tools read `product_image_uri` from `ToolContext.state` (not via the LLM) for re
   (Funded → InProgress → Delivered → Released / Refunded). The agent runs in a worker thread
   (blocking image/Veo tools must not block the web loop); assets are served via a GCS proxy.
   Deployed to Cloud Run.
-- The agent is also published as an **A2A** service (`to_a2a`) with a discoverable AgentCard at
-  `/.well-known/agent-card.json` (protocol 0.3.0) — other agents can hire it over the protocol.
+- The agent is also published as an **A2A** service (`to_a2a`), mounted on the marketplace at
+  `/a2a`, with a discoverable AgentCard at `/a2a/.well-known/agent-card.json` (protocol 0.3.0) —
+  other agents can hire it over the protocol.
 
 ## Planned
 - Signed-URL delivery; real payment rails; richer multi-turn chat intake.

@@ -37,7 +37,7 @@ cards, ad copy, and a short video. The exact product, in the brand's palette, on
 
 ### 1:35–1:50 — Escrow + A2A
 **On screen:** click **"Accept & release escrow"** → status **Completed**, escrow **Released**.
-Then show the agent's **A2A AgentCard** JSON at `/.well-known/agent-card.json`.
+Then show the agent's **A2A AgentCard** JSON at `/a2a/.well-known/agent-card.json`.
 **VO:** "Accept the work and escrow releases — pay for results. And because the agent is published
 over A2A, other agents can discover and hire it too."
 
@@ -53,6 +53,6 @@ and Cloud Run. Lumina — content production as a hireable agent."
 - A clean run recorded at **IMAGE_COUNT=8–12** for a fuller gallery (pre-render so the demo isn't
   waiting on generation; or speed-ramp the wait).
 - Cloud Trace screenshot/scroll for the deployed agent.
-- The AgentCard JSON (`curl .../.well-known/agent-card.json | jq`).
+- The AgentCard JSON (`curl .../a2a/.well-known/agent-card.json | jq`).
 - Side-by-side of the input product photo vs a generated image (fidelity proof).
 - The architecture diagram exported to PNG.

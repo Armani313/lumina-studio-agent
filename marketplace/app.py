@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
@@ -22,8 +23,19 @@ from lumina.config import settings
 from lumina.tools.delivery import mime_for_uri, upload_bytes
 
 from . import escrow
+from .a2a_server import a2a_app
 
-app = FastAPI(title="Lumina Studio Marketplace")
+
+@asynccontextmanager
+async def _lifespan(_app):
+    # Propagate the mounted A2A app's lifespan so its discoverable AgentCard route is built.
+    async with a2a_app.router.lifespan_context(a2a_app):
+        yield
+
+
+app = FastAPI(title="Lumina Studio Marketplace", lifespan=_lifespan)
+# Publish the agent over A2A on the same service; AgentCard at /a2a/.well-known/agent-card.json
+app.mount("/a2a", a2a_app)
 
 
 @app.get("/", response_class=HTMLResponse)

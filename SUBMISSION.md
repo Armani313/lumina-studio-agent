@@ -64,9 +64,10 @@ threaded to the image/video/QA tools through `ToolContext.state` (not the LLM) f
 ## 5. Monetization & interoperability
 - **Escrow marketplace** (Cloud Run + Firestore): `Funded → InProgress → Delivered → Released`
   (or `Refunded`). A client funds a job; the agent fulfils it; acceptance releases escrow.
-- **A2A:** the agent is also published as an **A2A service** with a discoverable AgentCard
-  (`/.well-known/agent-card.json`, protocol 0.3.0) — other agents can discover and hire it. This is
-  the bridge to an agent-to-agent economy / Cloud Marketplace.
+- **A2A:** the agent is also published as an **A2A service** (`to_a2a`), mounted on the same Cloud
+  Run service at `/a2a`, with a discoverable AgentCard at `/a2a/.well-known/agent-card.json`
+  (protocol 0.3.0) — other agents can discover and hire it. This is the bridge to an agent-to-agent
+  economy / Cloud Marketplace.
 
 ## 6. Technology (all mandatory + encouraged)
 | Layer | Used |
