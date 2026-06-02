@@ -11,4 +11,3 @@ outputs/
 test_remote.py
 run_slice.py
 marketplace/smoke_test.py
-marketplace/a2a_server.py
