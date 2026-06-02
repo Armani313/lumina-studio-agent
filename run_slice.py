@@ -11,6 +11,7 @@ Run:
     .venv/bin/python run_slice.py [path/to/product_photo.png]
 """
 import asyncio
+import os
 import sys
 
 from google.genai import types
@@ -23,7 +24,7 @@ from lumina.tools.delivery import mime_for_uri, public_https_url, upload_bytes
 # product photo path as the first CLI arg.
 PRODUCT_PHOTO = sys.argv[1] if len(sys.argv) > 1 else "outputs/grounded_4x5.png"
 
-DESCRIPTION = (
+DESCRIPTION = os.getenv("BRIEF") or (
     "Brand: 'Aurelia' — minimalist premium skincare; calm, clinical tone; earthy neutral palette. "
     "Product (see the uploaded product photo): 'Aurelia Glow Serum', a vitamin-C serum in a frosted "
     "glass dropper bottle. Features: brightening, lightweight, fragrance-free. Channel: instagram. "

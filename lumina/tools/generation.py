@@ -84,10 +84,14 @@ def render_image_bytes(
     if product_uri:
         contents.append(types.Part.from_uri(file_uri=product_uri, mime_type=mime_for_uri(product_uri)))
         instruction = (
-            "Use the attached reference photo as the EXACT product — preserve its silhouette, "
-            "label text, colors and proportions precisely. Place that same product into a new, "
-            f"photorealistic, commercial-quality on-brand scene: {scene_description}. "
-            "Natural lighting, high detail, no added text overlays, no watermarks."
+            "The attached reference image shows the EXACT product to feature. Reproduce that SAME "
+            "product as the clear, prominent hero of a new photo: identical type, shape, color, "
+            "material, pattern, embellishments and any text or logo. Do NOT substitute a different "
+            "product, restyle it, or leave it out — it must be unmistakably the same item and "
+            "clearly visible and in focus. If the product is apparel or shown worn, feature the "
+            "garment faithfully (on a suitable model or as a clean flat-lay), preserving its exact "
+            f"design and details. Setting/scene: {scene_description}. Photorealistic, commercial "
+            "quality, natural lighting, no text overlays, no watermarks."
         )
     else:
         instruction = (

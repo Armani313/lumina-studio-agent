@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from google.adk.tools import ToolContext
 from google.genai import types
 
 from ..clients import gemini_client
 from ..config import settings
-from .delivery import mime_for_uri
+from .delivery import mime_for_uri, public_https_url, upload_bytes
+from .generation import render_image_bytes
 
 
 def review_image_brand_fit(
@@ -36,12 +38,14 @@ def review_image_brand_fit(
 
     if product_uri:
         prompt = (
-            "The FIRST image is the REAL product photo. The SECOND image is a generated marketing "
-            f"image for '{product_name}'.\n"
+            "The FIRST image is the REAL product. The SECOND image is a generated marketing image "
+            f"for '{product_name}'.\n"
             f"Brand voice: {brand_voice}\n"
-            "FAIL if the second image's product differs from the real one (different bottle shape, "
-            "label, wordmark, color or proportions), shows garbled text, distortions or unsafe "
-            "content, or violates the brand voice. Otherwise PASS.\n"
+            "PASS only if the SECOND image clearly and prominently shows the SAME product as the "
+            "first — same type, color, key design and embellishments. FAIL if the product is "
+            "missing or not clearly visible, is a different product, or differs in type, color or "
+            "design; also FAIL on garbled text, distortions, unsafe content, or brand-voice "
+            "violations.\n"
             "Return STRICT JSON: verdict ('pass'|'fail'), score (0.0-1.0), issues (array of short "
             "strings), fix_suggestion (one short sentence)."
         )
@@ -72,6 +76,39 @@ def review_image_brand_fit(
             "issues": ["unparseable QA response"],
             "fix_suggestion": "",
         }
+
+
+def replace_failed_image(
+    failed_gs_uri: str,
+    scene_description: str,
+    aspect_ratio: str = "1:1",
+    tool_context: ToolContext = None,
+) -> dict:
+    """Regenerate an image that failed QA (product-conditioned) and SWAP it into the delivered
+    image set, so the corrected asset — not the failed one — is what ships.
+
+    Args:
+        failed_gs_uri: gs:// URI of the image that failed review.
+        scene_description: the scene to regenerate, applying the fix_suggestion (keep the product
+            the clear, faithful hero).
+        aspect_ratio: aspect ratio of the shot ('1:1', '4:5', '9:16', '16:9').
+
+    Returns:
+        dict with 'old_uri', 'new_uri', 'https_url', or 'error'.
+    """
+    product_uri = tool_context.state.get("product_image_uri") if tool_context else None
+    out = render_image_bytes(scene_description, aspect_ratio, product_uri)
+    if not out:
+        return {"error": "regeneration produced no image"}
+    data, mime = out
+    ext = "png" if "png" in mime else "jpg"
+    new_uri = upload_bytes(data, f"images/{uuid.uuid4().hex}.{ext}", mime)
+    # Swap the failed URI for the corrected one in the delivered image set (state['images'] is the
+    # producer's output string; the marketplace extracts asset URIs from it).
+    if tool_context is not None:
+        imgs = str(tool_context.state.get("images") or "")
+        tool_context.state["images"] = imgs.replace(failed_gs_uri, new_uri)
+    return {"old_uri": failed_gs_uri, "new_uri": new_uri, "https_url": public_https_url(new_uri)}
 
 
 def exit_loop(tool_context: ToolContext) -> dict:

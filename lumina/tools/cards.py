@@ -53,8 +53,9 @@ def make_product_card(
     """
     product_uri = tool_context.state.get("product_image_uri") if tool_context else None
     scene = (
-        f"{bg_scene_description}. Compose with generous clean negative space in the lower third "
-        "for text; minimal, premium, on-brand."
+        f"{bg_scene_description}. Feature the product prominently and faithfully in the upper "
+        "two-thirds; keep clean negative space in the lower third for text; minimal, premium, "
+        "on-brand."
     )
     out = render_image_bytes(scene, aspect_ratio, product_uri)
     if not out:
