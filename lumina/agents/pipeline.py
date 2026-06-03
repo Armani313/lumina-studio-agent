@@ -11,15 +11,17 @@ from .planner import shot_planner_agent
 from .production import production_agent
 from .qa import qa_loop_agent
 from .research import grounding_agent
+from .vision import product_vision_agent
 
 root_agent = SequentialAgent(
     name="lumina_pipeline",
     description=(
-        "Autonomous on-brand content studio: intake -> brand grounding (web + RAG) -> shot "
-        "planning -> concurrent image+copy production -> product cards -> self-correcting QA "
-        "loop -> delivery."
+        "Autonomous on-brand content studio: see the product photo -> intake -> brand grounding "
+        "(web + RAG) -> shot planning -> concurrent image+copy+video production -> product cards "
+        "-> self-correcting QA loop -> delivery."
     ),
     sub_agents=[
+        product_vision_agent,
         intake_agent,
         grounding_agent,
         shot_planner_agent,

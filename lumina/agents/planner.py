@@ -19,6 +19,7 @@ shot_planner_agent = LlmAgent(
         f"and forbidden elements. Choose one primary copy_channel. Write vivid, product-focused "
         f"scene descriptions.\n\n"
         "Creative brief:\n{brief}\n\n"
+        "Actual product (from photo):\n{product_description?}\n\n"
         "Brand research (web):\n{brand_research?}\n\n"
         "Brand guidelines (retrieved):\n{brand_knowledge?}"
     ),

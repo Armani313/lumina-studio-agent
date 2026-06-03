@@ -104,10 +104,16 @@ async def _run_job(jid: str, brief: str, product_uri: str) -> None:
         msg = types.Content(role="user", parts=[types.Part(text=brief)])
         seen: set[str] = set()
         async for ev in runner.run_async(user_id=jid, session_id=session.id, new_message=msg):
-            a = getattr(ev, "author", None)
-            if a and a not in seen:
+            a = getattr(ev, "author", None) or "agent"
+            if a not in seen:
                 seen.add(a)
-                escrow.add_event(jid, f"agent stage: {a}")
+                escrow.add_event(jid, f"stage: {a}")
+            # Granular sub-progress (esp. during the long QA loop) so the UI never looks frozen.
+            if ev.content and ev.content.parts:
+                for p in ev.content.parts:
+                    fc = getattr(p, "function_call", None)
+                    if fc and getattr(fc, "name", None):
+                        escrow.add_event(jid, f"  {a} → {fc.name}")
         s = await runner.session_service.get_session(
             app_name="lumina_mkt", user_id=jid, session_id=session.id
         )

@@ -9,9 +9,13 @@ intake_agent = LlmAgent(
     model=settings.model_reasoning,
     description="Parses a freeform product brief into a structured CreativeBrief.",
     instruction=(
-        "You are the intake analyst for a content studio. From the user's product brief, "
-        "extract a structured creative brief: infer a concise brand_voice, the product_type, "
-        "the key_features, and the target channels. Stay faithful to the brief."
+        "You are the intake analyst for a content studio. You receive the user's (possibly terse) "
+        "product brief AND a factual description of the ACTUAL product taken from its photo. Build "
+        "a structured creative brief accurate to the REAL product: set product_name, product_type "
+        "and key_features primarily from the product description; take brand_name, brand_voice and "
+        "channels from the user's brief (infer sensibly if missing). When the user's brief is "
+        "vague or conflicts with the photo, trust the product description.\n\n"
+        "Actual product (from the photo):\n{product_description?}"
     ),
     output_schema=CreativeBrief,
     output_key="brief",
