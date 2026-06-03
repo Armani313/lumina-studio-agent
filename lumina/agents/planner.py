@@ -19,8 +19,8 @@ shot_planner_agent = LlmAgent(
         f"and forbidden elements. Choose one primary copy_channel. Write vivid, product-focused "
         f"scene descriptions.\n\n"
         "Creative brief:\n{brief}\n\n"
-        "Brand research (web):\n{brand_research}\n\n"
-        "Brand guidelines (retrieved):\n{brand_knowledge}"
+        "Brand research (web):\n{brand_research?}\n\n"
+        "Brand guidelines (retrieved):\n{brand_knowledge?}"
     ),
     output_schema=ShotPlan,
     output_key="plan",

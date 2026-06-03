@@ -13,7 +13,7 @@ delivery_agent = LlmAgent(
         "images, the product cards, the video(s), the copy and the QA report below, then call "
         "write_manifest with that JSON string. Finally reply with a short human summary of the "
         "delivered package (counts of images, cards and videos) plus the manifest https_url.\n\n"
-        "Images:\n{images}\n\nCards:\n{cards}\n\nVideos:\n{videos}\n\nCopy:\n{copy_doc}\n\nQA report:\n{qa_report}"
+        "Images:\n{images}\n\nCards:\n{cards?}\n\nVideos:\n{videos?}\n\nCopy:\n{copy_doc?}\n\nQA report:\n{qa_report?}"
     ),
     tools=[write_manifest],
     output_key="package",
