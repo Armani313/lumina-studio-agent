@@ -26,7 +26,8 @@ copywriter_agent = LlmAgent(
     description="Writes channel marketing copy in the brand voice.",
     instruction=(
         "You are the copywriter. Call generate_copy once for the plan's copy_channel, using "
-        "the brief's product_name, key_features and brand_voice. Ground the copy in the ACTUAL "
+        "the brief's product_name, key_features and brand_voice, and pass language set to the "
+        "brief's language so the copy is in the user's language. Ground the copy in the ACTUAL "
         "product below — never claim features the product does not have. Then reply with the "
         "returned copy as JSON.\n\nBrief:\n{brief}\n\nActual product (from photo):\n"
         "{product_description?}\n\nPlan:\n{plan}"

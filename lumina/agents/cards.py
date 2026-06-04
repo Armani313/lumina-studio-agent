@@ -13,7 +13,8 @@ card_production_agent = LlmAgent(
         "make_product_card TWICE to produce 2 distinct card variants (e.g. one benefit-led, one "
         "minimalist hero). For each: a short headline (<=42 chars), one subtext line (<=90 chars), "
         "3 feature bullets, the brand wordmark (use brand_name from the brief), and a background "
-        "scene description that leaves clean negative space for text. Then reply with a JSON array "
+        "scene description that leaves clean negative space for text. Write the headline, subtext "
+        "and bullets in the brief's language (the user's language). Then reply with a JSON array "
         "of the produced card gs_uris.\n\n"
         "Brief:\n{brief}\n\nPlan:\n{plan}\n\nCopy:\n{copy_doc?}"
     ),

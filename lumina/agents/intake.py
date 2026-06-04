@@ -14,7 +14,9 @@ intake_agent = LlmAgent(
         "a structured creative brief accurate to the REAL product: set product_name, product_type "
         "and key_features primarily from the product description; take brand_name, brand_voice and "
         "channels from the user's brief (infer sensibly if missing). When the user's brief is "
-        "vague or conflicts with the photo, trust the product description.\n\n"
+        "vague or conflicts with the photo, trust the product description. Also detect the "
+        "language the USER wrote their brief in and set `language` (e.g. 'Russian', 'English') — "
+        "all customer-facing copy and card text will be produced in that language.\n\n"
         "Actual product (from the photo):\n{product_description?}"
     ),
     output_schema=CreativeBrief,

@@ -122,6 +122,7 @@ async def _run_job(jid: str, brief: str, product_uri: str) -> None:
             "assets": escrow.extract_assets(st),
             "copy": st.get("copy_doc"),
             "qa_report": st.get("qa_report"),
+            "qa_scores": st.get("qa_scores") or [],
         }
         escrow.set_delivered(jid, package)
     except Exception as e:  # noqa: BLE001
@@ -167,8 +168,10 @@ INDEX_HTML = """<!doctype html>
         <span id="escrow" class="text-xs px-2 py-1 rounded-full bg-amber-100 text-amber-800"></span>
       </div>
     </div>
-    <ol id="events" class="mt-3 text-xs text-stone-500 space-y-1"></ol>
+    <div id="now" class="mt-3 text-sm text-stone-700 flex items-center gap-2"></div>
+    <ol id="events" class="mt-2 text-xs text-stone-400 space-y-1 max-h-40 overflow-auto"></ol>
     <div id="copy" class="mt-4 text-sm hidden"></div>
+    <div id="scorecard" class="mt-4 hidden"></div>
     <div id="gallery" class="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-3"></div>
     <button id="acceptBtn" class="mt-4 hidden bg-emerald-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-emerald-500">
       Accept &amp; release escrow
@@ -185,6 +188,7 @@ $('#orderForm').addEventListener('submit', async (e) => {
   const r = await fetch('/api/jobs', { method: 'POST', body: new FormData(e.target) });
   const j = await r.json();
   jid = j.job_id;
+  window.__t0 = Date.now();
   $('#job').classList.remove('hidden');
   $('#jid').textContent = jid;
   poll();
@@ -202,6 +206,12 @@ async function poll(){
   badge($('#escrow'), 'escrow: ' + j.escrow, j.escrow==='Released' ? 'bg-emerald-100 text-emerald-800' :
         j.escrow==='Refunded' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-800');
   $('#events').innerHTML = (j.events||[]).map(e => '<li>• ' + e.msg + '</li>').join('');
+  const inProg = j.status==='InProgress';
+  const lastEv = (j.events||[]).slice(-1)[0];
+  const elapsed = Math.floor((Date.now()-(window.__t0||Date.now()))/1000);
+  $('#now').innerHTML = (inProg ? '<span class="inline-block h-3 w-3 border-2 border-stone-400 border-t-transparent rounded-full animate-spin"></span>' : '') + '<span>'+(lastEv?lastEv.msg:'')+'</span>' + (inProg?' <span class="text-stone-400">· '+elapsed+'s</span>':'');
+  const sc = (j.package && j.package.qa_scores) || [];
+  if(sc.length){ $('#scorecard').classList.remove('hidden'); $('#scorecard').innerHTML = '<div class="font-medium text-sm">Quality scorecard</div>' + sc.map((s,i)=>'<div class="text-xs flex justify-between border-b border-stone-100 py-1"><span>'+(s.verdict==='pass'?'✓':'✗')+' Asset '+(i+1)+'</span><span class="font-mono text-stone-500">'+Math.round((s.score||0)*100)+'%</span></div>').join(''); }
   if(j.package){
     const a = j.package.assets || [];
     $('#gallery').innerHTML = a.map(x => x.type==='video'

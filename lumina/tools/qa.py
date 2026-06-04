@@ -68,14 +68,27 @@ def review_image_brand_fit(
         ),
     )
     try:
-        return json.loads(resp.text)
+        result = json.loads(resp.text)
     except Exception:
-        return {
+        result = {
             "verdict": "pass",
             "score": 0.5,
             "issues": ["unparseable QA response"],
             "fix_suggestion": "",
         }
+    # Accumulate a structured quality scorecard in state (surfaced in the delivered package).
+    if tool_context is not None:
+        scores = list(tool_context.state.get("qa_scores") or [])
+        scores.append(
+            {
+                "uri": gs_uri,
+                "verdict": result.get("verdict"),
+                "score": result.get("score"),
+                "issues": result.get("issues") or [],
+            }
+        )
+        tool_context.state["qa_scores"] = scores
+    return result
 
 
 def replace_failed_image(

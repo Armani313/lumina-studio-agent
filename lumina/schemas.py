@@ -11,6 +11,10 @@ class CreativeBrief(BaseModel):
     key_features: str = Field(description="Comma-separated key features/benefits.")
     brand_voice: str = Field(description="Concise brand tone, e.g. 'minimalist, premium, calm'.")
     channels: list[str] = Field(description="Target channels, e.g. ['instagram','amazon'].")
+    language: str = Field(
+        description="Language the USER wrote the brief in (e.g. 'Russian', 'English'). ALL "
+        "customer-facing copy and card text must be produced in this language."
+    )
 
 
 class Shot(BaseModel):

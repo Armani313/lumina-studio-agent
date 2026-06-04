@@ -41,7 +41,9 @@ def _image_generate_with_retry(contents, config, attempts: int = 5):
             raise
 
 
-def generate_copy(product_name: str, key_features: str, brand_voice: str, channel: str) -> dict:
+def generate_copy(
+    product_name: str, key_features: str, brand_voice: str, channel: str, language: str = "English"
+) -> dict:
     """Generate channel-ready marketing copy for a product, in the brand's voice.
 
     Args:
@@ -49,12 +51,14 @@ def generate_copy(product_name: str, key_features: str, brand_voice: str, channe
         key_features: Comma-separated key features/benefits.
         brand_voice: Short description of brand tone (e.g. 'minimalist, premium, calm').
         channel: Target channel: 'amazon', 'instagram', or 'website'.
+        language: Language to write ALL copy in (e.g. 'Russian', 'English') — match the user's brief.
 
     Returns:
         A dict with keys: title, short, detailed, bullets.
     """
     prompt = (
         f"You are a senior DTC copywriter. Write {channel} product copy.\n"
+        f"Write ALL fields ENTIRELY in {language} (the user's language).\n"
         f"Brand voice: {brand_voice}\n"
         f"Product: {product_name}\n"
         f"Key features: {key_features}\n"
