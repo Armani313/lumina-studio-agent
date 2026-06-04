@@ -17,13 +17,19 @@ from .delivery import mime_for_uri, public_https_url
 
 
 def generate_product_video(
-    concept: str, aspect_ratio: str = "9:16", tool_context: ToolContext = None
+    concept: str,
+    aspect_ratio: str = "9:16",
+    duration_seconds: int = 8,
+    person_generation: str = "allow_adult",
+    tool_context: ToolContext = None,
 ) -> dict:
-    """Generate a short cinematic product video with Veo, animating from the product photo.
+    """Generate a short product video with Veo, animating from the product photo.
 
     Args:
-        concept: Motion/mood concept (e.g. 'slow cinematic push-in, soft light shift, gentle').
+        concept: Motion/mood concept (e.g. 'extreme close-up macro, slow rack focus, soft light').
         aspect_ratio: '9:16' (vertical) or '16:9' (landscape).
+        duration_seconds: Clip length (Veo supports up to ~8s).
+        person_generation: 'allow_adult' (UGC with people) or 'dont_allow' (product-only).
 
     Returns:
         A dict with 'gs_uri' and 'https_url' of the video, or 'error'.
@@ -44,6 +50,8 @@ def generate_product_video(
         config=types.GenerateVideosConfig(
             number_of_videos=1,
             aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            person_generation=person_generation,
             output_gcs_uri=out_prefix,
             generate_audio=False,
         ),

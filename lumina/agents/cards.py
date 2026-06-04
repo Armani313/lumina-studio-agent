@@ -9,14 +9,15 @@ card_production_agent = LlmAgent(
     model=settings.model_reasoning,
     description="Produces marketplace product-card variants (on-brand image + crisp composited text).",
     instruction=(
-        "You design marketplace product cards. Using the brief, plan and copy below, call "
-        "make_product_card TWICE to produce 2 distinct card variants (e.g. one benefit-led, one "
-        "minimalist hero). For each: a short headline (<=42 chars), one subtext line (<=90 chars), "
-        "3 feature bullets, the brand wordmark (use brand_name from the brief), and a background "
-        "scene description that leaves clean negative space for text. Write the headline, subtext "
-        "and bullets in the brief's language (the user's language). Then reply with a JSON array "
-        "of the produced card gs_uris.\n\n"
-        "Brief:\n{brief}\n\nPlan:\n{plan}\n\nCopy:\n{copy_doc?}"
+        "You design high-converting marketplace product cards. Using the brief, plan and copy "
+        "below, call make_product_card TWICE for 2 distinct, SELLING card variants (e.g. one "
+        "benefit-led, one emotional/hero). For each pass provide: a punchy headline (<=42 chars), "
+        "one supporting subtext line (<=90 chars), 4 short benefit bullets, a short call-to-action "
+        "(cta, <=20 chars, e.g. 'Shop now'), the brand wordmark (brand_name from the brief), and a "
+        "background scene description that leaves clean negative space in the lower third for text. "
+        "Make the wording persuasive; write headline, subtext, bullets and cta in the brief's "
+        "language (the user's language). Then reply with a JSON array of the produced card gs_uris.\n\n"
+        "Brief:\n{brief}\n\nPlan:\n{plan}\n\nCopy (reuse the strongest angles):\n{copy_doc?}"
     ),
     tools=[make_product_card],
     output_key="cards",

@@ -57,20 +57,26 @@ def generate_copy(
         A dict with keys: title, short, detailed, bullets.
     """
     prompt = (
-        f"You are a senior DTC copywriter. Write {channel} product copy.\n"
-        f"Write ALL fields ENTIRELY in {language} (the user's language).\n"
-        f"Brand voice: {brand_voice}\n"
-        f"Product: {product_name}\n"
-        f"Key features: {key_features}\n"
-        "Return STRICT JSON with keys: title (<=60 chars), short (<=160 chars), "
-        "detailed (2-3 sentences), bullets (array of 3-5 short strings)."
+        f"You are a senior DTC copywriter. Write vivid, SELLING {channel} marketing copy — "
+        f"benefit-led and persuasive, never dry.\n"
+        f"Write ALL text ENTIRELY in {language} (the user's language).\n"
+        f"Brand voice: {brand_voice}\nProduct: {product_name}\nKey features: {key_features}\n"
+        "Return STRICT JSON with keys:\n"
+        "  title: punchy headline (<=60 chars)\n"
+        "  short: concise tagline (<=160 chars)\n"
+        "  long: rich 4-5 sentence SEO product description\n"
+        "  emotional: 2-3 evocative, feeling-led sentences\n"
+        "  bullets: array of 4-5 short benefit bullets\n"
+        "  cta: short call-to-action (<=20 chars)\n"
+        "  keywords: array of 6-10 SEO keywords\n"
+        "  reviews: array of 3 objects {author, rating (integer 1-5), text (1-2 sentences)}"
     )
     resp = gemini_client().models.generate_content(
         model=settings.model_reasoning,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            max_output_tokens=2048,  # gemini-3.x flash is a thinking model — leave headroom
+            max_output_tokens=6144,  # multi-variant copy; thinking model needs headroom
         ),
     )
     try:
