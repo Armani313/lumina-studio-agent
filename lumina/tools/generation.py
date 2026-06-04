@@ -42,7 +42,12 @@ def _image_generate_with_retry(contents, config, attempts: int = 5):
 
 
 def generate_copy(
-    product_name: str, key_features: str, brand_voice: str, channel: str, language: str = "English"
+    product_name: str,
+    key_features: str,
+    brand_voice: str,
+    channel: str,
+    language: str = "English",
+    tool_context: ToolContext = None,
 ) -> dict:
     """Generate channel-ready marketing copy for a product, in the brand's voice.
 
@@ -76,13 +81,18 @@ def generate_copy(
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            max_output_tokens=6144,  # multi-variant copy; thinking model needs headroom
+            max_output_tokens=8192,  # multi-variant copy; thinking model needs headroom
         ),
     )
     try:
-        return json.loads(resp.text)
+        result = json.loads(resp.text)
     except Exception:
-        return {"raw": resp.text}
+        result = {"raw": resp.text}
+    # Persist the FULL multi-variant copy to state so delivery uses it verbatim (the copywriter's
+    # text echo can drop fields).
+    if tool_context is not None:
+        tool_context.state["copy_full"] = result
+    return result
 
 
 def render_image_bytes(

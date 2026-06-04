@@ -120,7 +120,7 @@ async def _run_job(jid: str, brief: str, product_uri: str) -> None:
         st = dict(s.state)
         package = {
             "assets": escrow.extract_assets(st),
-            "copy": st.get("copy_doc"),
+            "copy": st.get("copy_full") or st.get("copy_doc"),
             "qa_report": st.get("qa_report"),
             "qa_scores": st.get("qa_scores") or [],
         }
@@ -217,7 +217,20 @@ async function poll(){
     $('#gallery').innerHTML = a.map(x => x.type==='video'
       ? `<video controls class="rounded-lg w-full" src="/api/asset?uri=${encodeURIComponent(x.uri)}"></video>`
       : `<img class="rounded-lg w-full" src="/api/asset?uri=${encodeURIComponent(x.uri)}">`).join('');
-    if(j.package.copy){ $('#copy').classList.remove('hidden'); $('#copy').innerHTML = '<div class="font-medium">Ad copy</div><pre class="whitespace-pre-wrap text-xs text-stone-600 mt-1">'+ (j.package.copy||'') +'</pre>'; }
+    const cp = j.package.copy;
+    if(cp){ $('#copy').classList.remove('hidden');
+      let h = '<div class="font-medium text-sm">Marketing copy</div>';
+      if(typeof cp === 'string'){ h += '<pre class="whitespace-pre-wrap text-xs text-stone-600 mt-1">'+cp+'</pre>'; }
+      else {
+        if(cp.title) h += '<div class="mt-2 font-semibold text-stone-800">'+cp.title+'</div>';
+        if(cp.short) h += '<div class="text-sm text-stone-600">'+cp.short+'</div>';
+        if(cp.long) h += '<div class="mt-2 text-xs text-stone-600"><span class="text-stone-400">Long: </span>'+cp.long+'</div>';
+        if(cp.emotional) h += '<div class="mt-1 text-xs text-stone-600 italic">'+cp.emotional+'</div>';
+        if(Array.isArray(cp.bullets)) h += '<ul class="mt-1 text-xs text-stone-600 list-disc ml-4">'+cp.bullets.map(b=>'<li>'+b+'</li>').join('')+'</ul>';
+        if(Array.isArray(cp.reviews)) h += '<div class="mt-2 text-xs text-stone-600"><span class="text-stone-400">Reviews:</span>'+cp.reviews.map(r=>'<div class="mt-1">'+('★'.repeat(r.rating||5))+' '+(r.text||'')+' <span class="text-stone-400">— '+(r.author||'')+'</span></div>').join('')+'</div>';
+      }
+      $('#copy').innerHTML = h;
+    }
   }
   if(j.status==='Delivered'){ $('#acceptBtn').classList.remove('hidden'); }
   if(j.status==='Completed' || j.status==='Failed'){ clearInterval(timer); }
