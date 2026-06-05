@@ -88,6 +88,8 @@ def generate_copy(
         result = json.loads(resp.text)
     except Exception:
         result = {"raw": resp.text}
+    if not isinstance(result, dict):  # model may return a JSON array
+        result = {"raw": result}
     # Persist the FULL multi-variant copy to state so delivery uses it verbatim (the copywriter's
     # text echo can drop fields).
     if tool_context is not None:

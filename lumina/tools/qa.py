@@ -76,6 +76,8 @@ def review_image_brand_fit(
             "issues": ["unparseable QA response"],
             "fix_suggestion": "",
         }
+    if not isinstance(result, dict):  # model may return a JSON array
+        result = {"verdict": "pass", "score": 0.5, "issues": ["non-object QA response"], "fix_suggestion": ""}
     # Accumulate a structured quality scorecard in state (surfaced in the delivered package).
     if tool_context is not None:
         scores = list(tool_context.state.get("qa_scores") or [])

@@ -88,6 +88,8 @@ def describe_product(tool_context: ToolContext = None) -> dict:
         spec = json.loads(resp.text)
     except Exception:
         spec = {"category": "other", "product_description": (resp.text or "").strip()}
+    if not isinstance(spec, dict):  # model may return a JSON array
+        spec = {"category": "other", "product_description": str(spec)[:600]}
 
     category = str(spec.get("category") or "other").strip().lower()
     category = _ALIASES.get(category, category)

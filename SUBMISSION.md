@@ -5,9 +5,9 @@
 An autonomous, multi-agent **on-brand content studio** that a brand can *hire* through an
 escrow marketplace. Give it a product photo, a short brief, and (optionally) a brand link; it
 researches the brand, plans the shoot, generates a faithful on-brand content package — lifestyle
-imagery, marketplace product cards, ad copy, and a short video — checks its own work for product
-fidelity and brand consistency, and delivers the package. Built net-new on **Google ADK** and the
-**Gemini Enterprise Agent Platform (Vertex AI)**.
+imagery, styled marketplace cards, multi-variant copy, and two short videos (macro + UGC) — checks
+its own work for product fidelity and brand consistency, and delivers the package. Built net-new on
+**Google ADK** and the **Gemini Enterprise Agent Platform (Vertex AI)**.
 
 ---
 
@@ -34,32 +34,42 @@ A root `SequentialAgent` orchestrates the pipeline, using all three ADK workflow
 
 ```
 product photo + brief
-  → intake            (LlmAgent, output_schema=CreativeBrief)
+  → product_vision    (sees the photo: classifies category + writes a precise product description)
+  → intake            (LlmAgent, output_schema=CreativeBrief incl. detected language)
   → grounding         (ParallelAgent)
         ├ brand_research  (google_search — live web grounding)
         └ brand_rag       (VertexAiSearchTool — brand-guideline RAG)
-  → shot_planner      (LlmAgent, output_schema=ShotPlan, N shots)
+  → shot_planner      (LlmAgent, output_schema=ShotPlan; category-driven shot strategy)
   → production        (ParallelAgent)
         ├ image_production  (×N, image-conditioned on the product photo)
-        ├ copywriter        (channel copy in brand voice)
-        └ video_production  (Veo image-to-video)
-  → card_production   (2 product cards: generated background + crisp composited text)
+        ├ copywriter        (multi-variant copy in the user's language)
+        └ video_production  (TWO Veo clips: a macro detail clip + a UGC-style clip)
+  → card_production   (2 styled, selling cards: generated bg + composited typography + CTA pill)
   → qa_loop           (LoopAgent ≤2: multimodal fidelity + brand review → regenerate fails → exit)
-  → delivery          (assemble package + manifest → Cloud Storage)
+  → delivery          (assemble package + quality scorecard + manifest → Cloud Storage)
 ```
 
 State flows via ADK session state (`output_key` + `{state}` interpolation). The product photo is
 threaded to the image/video/QA tools through `ToolContext.state` (not the LLM) for reliable fidelity.
 
 ## 4. What makes it production-grade
+- **Sees the product:** a vision stage classifies the product category from the photo and writes a
+  category-specific shot strategy (apparel → on-model/flat-lay, jewelry → macro, bottle → lifestyle),
+  so even a one-word brief yields accurate scenes and copy about the *real* product.
 - **Product fidelity:** image and video are *conditioned on the real product photo* (reference
   frame), so outputs depict the actual product; QA compares original vs generated and fails on drift.
 - **Grounding + RAG:** `google_search` for live brand/category research, and **Vertex AI Search**
   over a brand-guidelines data store so generated scenes cite the brand's exact palette, props, and
   forbidden elements.
-- **Self-correcting QA loop:** a multimodal reviewer scores each asset and regenerates failures
-  before delivery (`exit_loop` escalates to stop the loop).
-- **Robustness:** image generation is concurrency-throttled with exponential backoff on rate limits.
+- **Self-correcting QA loop + quality scorecard:** a multimodal reviewer scores each asset, swaps
+  regenerated fixes into the delivered set, and surfaces a per-asset fidelity/brand **scorecard**.
+- **Multi-variant copy, in the user's language:** title, short, long SEO, emotional, bullets, CTA,
+  keywords and customer reviews — produced in the language of the brief (e.g. a Russian brief → Russian copy).
+- **Styled, selling product cards:** crisp typography composited over a generated background
+  (gradient scrim, accent color sampled from the product, CTA pill) — not garbled image-model text.
+- **Two videos:** a macro detail clip and a UGC-style clip (Veo image-to-video).
+- **Robustness & UX:** image generation is concurrency-throttled with exponential backoff on rate
+  limits; per-tool sub-progress streams to the UI so long stages never look frozen.
 
 ## 5. Monetization & interoperability
 - **Escrow marketplace** (Cloud Run + Firestore): `Funded → InProgress → Delivered → Released`
