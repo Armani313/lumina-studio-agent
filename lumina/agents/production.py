@@ -10,10 +10,10 @@ image_production_agent = LlmAgent(
     model=settings.model_reasoning,
     description="Generates the planned lifestyle images.",
     instruction=(
-        "You produce lifestyle images. For EACH shot in the plan below, call "
-        "generate_lifestyle_image with that shot's scene_description and aspect_ratio. "
-        "After all shots are generated, reply with a JSON array where each element has the "
-        "fields channel, gs_uri and https_url.\n\n"
+        "You produce product images. For EACH shot in the plan below, call generate_lifestyle_image "
+        "with that shot's scene_description, aspect_ratio and shot_type (pass shot_type exactly — "
+        "'hero'/'ecommerce' shots are rendered at higher quality). After all shots are generated, "
+        "reply with a JSON array where each element has the fields channel, gs_uri and https_url.\n\n"
         "Shot plan:\n{plan}"
     ),
     tools=[generate_lifestyle_image],

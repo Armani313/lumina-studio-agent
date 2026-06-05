@@ -24,13 +24,17 @@ from .delivery import mime_for_uri, public_https_url, upload_bytes
 _IMG_SEM = threading.Semaphore(int(os.getenv("IMAGE_CONCURRENCY", "3")))
 
 
-def _image_generate_with_retry(contents, config, attempts: int = 5):
+_HERO_TYPES = {"hero", "ecommerce", "packshot"}  # rendered with the higher-quality Pro image model
+
+
+def _image_generate_with_retry(contents, config, model: str | None = None, attempts: int = 5):
     delay = 8.0
+    model = model or settings.model_image
     for i in range(attempts):
         try:
             with _IMG_SEM:
                 return gemini_client().models.generate_content(
-                    model=settings.model_image, contents=contents, config=config
+                    model=model, contents=contents, config=config
                 )
         except genai_errors.APIError as e:
             transient = getattr(e, "code", None) in (429, 503, 500) or "RESOURCE_EXHAUSTED" in str(e)
@@ -97,11 +101,23 @@ def generate_copy(
     return result
 
 
+_QUALITY = (
+    " Professional product photography: studio-grade, intentional lighting; considered composition "
+    "and negative space; crisp focus on the product with rich, true-to-life detail and texture; "
+    "tasteful color grading; sharp, high-resolution, premium magazine / e-commerce quality. "
+    "No text overlays, no watermarks, no distortion."
+)
+
+
 def render_image_bytes(
-    scene_description: str, aspect_ratio: str = "1:1", product_uri: str | None = None
+    scene_description: str,
+    aspect_ratio: str = "1:1",
+    product_uri: str | None = None,
+    model: str | None = None,
 ):
     """Generate one image and return (bytes, mime), or None. Image-conditioned on product_uri
-    when given. Shared by generate_lifestyle_image and the product-card tool."""
+    when given; `model` selects flash vs the Pro image model. Shared by generate_lifestyle_image
+    and the product-card tool."""
     contents: list = []
     if product_uri:
         contents.append(types.Part.from_uri(file_uri=product_uri, mime_type=mime_for_uri(product_uri)))
@@ -112,14 +128,10 @@ def render_image_bytes(
             "product, restyle it, or leave it out — it must be unmistakably the same item and "
             "clearly visible and in focus. If the product is apparel or shown worn, feature the "
             "garment faithfully (on a suitable model or as a clean flat-lay), preserving its exact "
-            f"design and details. Setting/scene: {scene_description}. Photorealistic, commercial "
-            "quality, natural lighting, no text overlays, no watermarks."
+            f"design and details. Setting/scene: {scene_description}." + _QUALITY
         )
     else:
-        instruction = (
-            "Professional, photorealistic, commercial-quality on-brand product photograph. "
-            f"{scene_description}. Natural lighting, high detail, no text overlays, no watermarks."
-        )
+        instruction = (f"On-brand product photograph. {scene_description}." + _QUALITY)
     contents.append(types.Part(text=instruction))
 
     resp = _image_generate_with_retry(
@@ -128,6 +140,7 @@ def render_image_bytes(
             response_modalities=["IMAGE"],
             image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
         ),
+        model=model,
     )
     for cand in resp.candidates or []:
         for part in (cand.content.parts or []):
@@ -138,9 +151,12 @@ def render_image_bytes(
 
 
 def generate_lifestyle_image(
-    scene_description: str, aspect_ratio: str = "1:1", tool_context: ToolContext = None
+    scene_description: str,
+    aspect_ratio: str = "1:1",
+    shot_type: str = "lifestyle",
+    tool_context: ToolContext = None,
 ) -> dict:
-    """Generate an on-brand photorealistic lifestyle image and store it in GCS.
+    """Generate an on-brand photorealistic image and store it in GCS.
 
     If a product reference photo exists in session state, the SAME product is depicted in the
     new scene (image-conditioned generation for product fidelity).
@@ -148,12 +164,15 @@ def generate_lifestyle_image(
     Args:
         scene_description: Vivid description of the scene/setting and product placement.
         aspect_ratio: One of '1:1', '4:5', '9:16', '16:9'.
+        shot_type: hero / ecommerce / macro / lifestyle / flatlay / on_model. 'hero' and
+            'ecommerce' shots are rendered with the higher-quality Pro image model.
 
     Returns:
         A dict with 'gs_uri' and 'https_url' of the stored image, or 'error'.
     """
     product_uri = tool_context.state.get("product_image_uri") if tool_context else None
-    out = render_image_bytes(scene_description, aspect_ratio, product_uri)
+    model = settings.model_image_pro if (shot_type or "").lower() in _HERO_TYPES else settings.model_image
+    out = render_image_bytes(scene_description, aspect_ratio, product_uri, model=model)
     if not out:
         return {"error": "no image part returned"}
     data, mime = out

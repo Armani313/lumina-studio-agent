@@ -21,6 +21,9 @@ class Shot(BaseModel):
     channel: str = Field(description="Channel this shot targets.")
     aspect_ratio: str = Field(description="One of 1:1, 4:5, 9:16, 16:9.")
     scene_description: str = Field(description="Vivid, on-brand scene/setting description.")
+    shot_type: str = Field(
+        description="Shot type: 'hero', 'ecommerce', 'macro', 'lifestyle', 'flatlay', or 'on_model'."
+    )
 
 
 class ShotPlan(BaseModel):
