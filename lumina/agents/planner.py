@@ -25,6 +25,7 @@ shot_planner_agent = LlmAgent(
         f"Choose one primary copy_channel.\n\n"
         "Product category: {product_category?}\n"
         "Shot strategy for this category:\n{shot_strategy?}\n\n"
+        "Suggested settings for THIS product:\n{suggested_settings?}\n\n"
         "Creative brief:\n{brief}\n\n"
         "Actual product (from photo):\n{product_description?}\n\n"
         "Brand research (web):\n{brand_research?}\n\n"

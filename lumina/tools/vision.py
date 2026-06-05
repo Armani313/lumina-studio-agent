@@ -70,18 +70,24 @@ def describe_product(tool_context: ToolContext = None) -> dict:
             types.Part.from_uri(file_uri=product_uri, mime_type=mime_for_uri(product_uri)),
             types.Part(
                 text=(
-                    "Look at this product photo. Return STRICT JSON with keys:\n"
+                    "You are a product analyst preparing a marketing shoot. First identify THE single "
+                    "product to feature: if it is worn by a person or shown among other items, focus "
+                    "on the product itself (e.g. the garment, NOT the model; the watch, NOT the "
+                    "wrist); if several products are shown, choose the single most prominent one. "
+                    "Return STRICT JSON:\n"
                     "  category: one of [apparel, jewelry, cosmetics, beverage, electronics, "
                     "footwear, accessory, home, food, other]\n"
-                    "  product_description: 2-4 factual sentences — the product type, materials, "
-                    "colors, distinctive design details, any visible text/logos, and whether it is "
-                    "shown standalone or worn.\n"
-                    "Describe ONLY what you actually see; do not invent a brand story."
+                    "  product_description: 3-5 factual sentences — exact product type, materials, "
+                    "colors, finish, distinctive design details, any visible text/logos, approximate "
+                    "scale, and whether it is standalone or worn. Describe ONLY what you actually "
+                    "see; do not invent features or a brand story.\n"
+                    "  suggested_settings: 2-3 short, product-appropriate settings / props / moods "
+                    "for marketing imagery of THIS specific product."
                 )
             ),
         ],
         config=types.GenerateContentConfig(
-            response_mime_type="application/json", max_output_tokens=2048
+            response_mime_type="application/json", max_output_tokens=3072
         ),
     )
     try:
@@ -97,9 +103,19 @@ def describe_product(tool_context: ToolContext = None) -> dict:
         category = "other"
     strategy = SHOT_STRATEGIES[category]
     description = (spec.get("product_description") or "").strip()
+    settings_hint = spec.get("suggested_settings")
+    if isinstance(settings_hint, list):
+        settings_hint = "; ".join(str(s) for s in settings_hint)
+    settings_hint = (settings_hint or "").strip()
 
     if tool_context is not None:
         tool_context.state["product_category"] = category
         tool_context.state["shot_strategy"] = strategy
+        tool_context.state["suggested_settings"] = settings_hint
 
-    return {"category": category, "product_description": description, "shot_strategy": strategy}
+    return {
+        "category": category,
+        "product_description": description,
+        "shot_strategy": strategy,
+        "suggested_settings": settings_hint,
+    }
