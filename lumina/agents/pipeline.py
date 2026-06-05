@@ -2,8 +2,9 @@
 
     Intake (brief) -> ShotPlanner (plan) -> [Image || Copy] -> QA loop -> Delivery
 """
-from google.adk.agents import SequentialAgent
+from google.adk.agents import LlmAgent, SequentialAgent
 
+from ..models import reasoning_model
 from .cards import card_production_agent
 from .delivery import delivery_agent
 from .intake import intake_agent
@@ -31,3 +32,14 @@ root_agent = SequentialAgent(
         delivery_agent,
     ],
 )
+
+
+def _apply_retry(agent) -> None:
+    """Give every LlmAgent a retry-enabled model so a transient 429/quota spike doesn't fail a stage."""
+    if isinstance(agent, LlmAgent):
+        agent.model = reasoning_model()
+    for sub in getattr(agent, "sub_agents", None) or []:
+        _apply_retry(sub)
+
+
+_apply_retry(root_agent)

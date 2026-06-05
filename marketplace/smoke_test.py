@@ -40,7 +40,11 @@ def main() -> None:
     last = 0
     for _ in range(80):
         time.sleep(8)
-        j = httpx.get(f"{BASE}/api/jobs/{jid}", headers=HEADERS, timeout=30).json()
+        try:
+            j = httpx.get(f"{BASE}/api/jobs/{jid}", headers=HEADERS, timeout=30).json()
+        except Exception as ex:  # tolerate transient connection resets during long polling
+            print("   (poll retry:", type(ex).__name__, ")")
+            continue
         for e in j.get("events", [])[last:]:
             print("   •", e["msg"])
         last = len(j.get("events", []))
