@@ -13,6 +13,7 @@ from google.cloud import firestore
 from lumina.config import settings
 
 JOBS = "marketplace_jobs"
+INBOUND = "marketplace_inbound"
 
 FUNDED = "Funded"
 IN_PROGRESS = "InProgress"
@@ -66,6 +67,21 @@ def add_event(jid: str, msg: str) -> None:
     db().collection(JOBS).document(jid).update(
         {"events": firestore.ArrayUnion([{"t": _now(), "msg": msg}])}
     )
+
+
+def log_inbound(payload: dict) -> str:
+    """Persist a raw inbound marketplace payload so we can map its contract."""
+    rid = uuid.uuid4().hex[:12]
+    db().collection(INBOUND).document(rid).set({"id": rid, "at": _now(), "payload": payload})
+    return rid
+
+
+def recent_inbound(limit: int = 5) -> list[dict]:
+    docs = (
+        db().collection(INBOUND).order_by("at", direction=firestore.Query.DESCENDING)
+        .limit(limit).stream()
+    )
+    return [d.to_dict() for d in docs]
 
 
 def set_delivered(jid: str, package: dict) -> None:

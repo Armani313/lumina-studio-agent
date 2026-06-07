@@ -8,18 +8,26 @@ Run:  .venv/bin/uvicorn marketplace.app:app --host 0.0.0.0 --port 8080
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
+import os
 import threading
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import httpx
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from google.cloud import storage
+from google.cloud.exceptions import NotFound
 from google.genai import types
 from google.adk.runners import InMemoryRunner
 
 from lumina.agent import root_agent
+from lumina.clients import gemini_client
 from lumina.config import settings
+from lumina.pricing import BASE_PRICE, PER_CARD, PER_IMAGE, PER_VIDEO
 from lumina.tools.delivery import mime_for_uri, upload_bytes
 
 from . import escrow
@@ -41,6 +49,265 @@ app.mount("/a2a", a2a_app)
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
     return INDEX_HTML
+
+
+# --- External marketplace integration (Simple Webhook v1: bearer-auth inbound + async callback) ---
+# The shared connection token is held in an env var (NEVER in code/git): MARKETPLACE_TOKEN.
+MARKETPLACE_TOKEN = os.getenv("MARKETPLACE_TOKEN", "")
+SERVICE_URL = os.getenv("SERVICE_URL", "https://lumina-marketplace-587790795280.us-central1.run.app")
+
+
+def _bearer_ok(authorization: str) -> bool:
+    """Constant-time compare of the request's Bearer token against our connection token."""
+    if not MARKETPLACE_TOKEN:
+        return False
+    presented = authorization[7:].strip() if authorization[:7].lower() == "bearer " else authorization.strip()
+    return hmac.compare_digest(presented, MARKETPLACE_TOKEN)
+
+
+def _first(d: dict, keys: list[str]) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v:
+            return v if isinstance(v, str) else str(v)
+    return ""
+
+
+def _proxy_url(gs_uri: str) -> str:
+    return f"{SERVICE_URL}/api/asset?uri=" + urllib.parse.quote(gs_uri, safe="")
+
+
+def _fetch_image_to_gcs(url: str) -> str | None:
+    """Download a buyer-provided product image URL into our bucket; return its gs:// URI."""
+    try:
+        r = httpx.get(url, timeout=45, follow_redirects=True)
+        r.raise_for_status()
+        ct = (r.headers.get("content-type") or "").lower()
+        ext = "png" if "png" in ct else ("webp" if "webp" in ct else "jpg")
+        return upload_bytes(r.content, f"inputs/mkt_{uuid.uuid4().hex}.{ext}", ct or "image/png")
+    except Exception:
+        return None
+
+
+def _post_callback(url: str, token: str, body: dict) -> None:
+    if not url:
+        return
+    try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        httpx.post(url, json=body, headers=headers, timeout=45)
+    except Exception:
+        pass
+
+
+def _build_outputs(state: dict) -> dict:
+    """Map the agent's delivered package into marketplace outputs (viewable proxy URLs + copy)."""
+    assets = escrow.extract_assets(state)
+    images = [_proxy_url(a["uri"]) for a in assets if a["type"] == "image"]
+    videos = [_proxy_url(a["uri"]) for a in assets if a["type"] == "video"]
+    cards = [_proxy_url(a["uri"]) for a in assets if a["type"] == "card"]
+    copy = state.get("copy_full") or state.get("copy_doc") or {}
+    title = copy.get("title") if isinstance(copy, dict) else ""
+    md = [f"## {title}" if title else "## Your on-brand content package"]
+    if isinstance(copy, dict) and copy.get("short"):
+        md.append(copy["short"])
+    if images:
+        md.append("**Images**\n" + "\n".join(f"![image]({u})" for u in images))
+    if cards:
+        md.append("**Product cards**\n" + "\n".join(f"![card]({u})" for u in cards))
+    if videos:
+        md.append("**Videos**\n" + "\n".join(f"- [video]({u})" for u in videos))
+    return {"markdown": "\n\n".join(md), "images": images, "cards": cards, "videos": videos, "copy": copy}
+
+
+async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_link: str,
+                               cb_url: str, cb_token: str) -> None:
+    """Background: run the full agent for an external-marketplace task, then POST the result."""
+    try:
+        product_uri = _fetch_image_to_gcs(image_url)
+        if not product_uri:
+            _post_callback(cb_url, cb_token, {"status": "failed", "error": "could not fetch product image"})
+            return
+        full_brief = brief if not brand_link else f"{brief}\nBrand link: {brand_link}"
+        seed = {"product_image_uri": product_uri, "brief_text": full_brief, "brand_link": brand_link}
+        spec = _spec_from_inputs(inputs)
+        if spec:
+            seed["spec"] = spec
+        runner = InMemoryRunner(agent=root_agent, app_name="lumina_ext")
+        uid = uuid.uuid4().hex
+        session = await runner.session_service.create_session(app_name="lumina_ext", user_id=uid, state=seed)
+        msg = types.Content(role="user", parts=[types.Part(text=full_brief)])
+        async for _ in runner.run_async(user_id=uid, session_id=session.id, new_message=msg):
+            pass
+        st = dict((await runner.session_service.get_session(
+            app_name="lumina_ext", user_id=uid, session_id=session.id)).state)
+        _post_callback(cb_url, cb_token, {"status": "completed", "outputs": _build_outputs(st)})
+    except Exception as e:  # noqa: BLE001
+        _post_callback(cb_url, cb_token, {"status": "failed", "error": str(e)[:300]})
+
+
+def _quote_cents(spec: dict, min_cents: int = 0) -> int:
+    """Our per-item price for an agreed spec, in integer cents (>= the platform floor)."""
+    imgs = int(spec.get("images") or spec.get("image_count") or 0)
+    vids = spec.get("videos")
+    vids = len(vids) if isinstance(vids, list) else int(vids or 0)
+    cards = int(spec.get("cards") or spec.get("card_count") or 0)
+    cents = (BASE_PRICE + PER_IMAGE * imgs + PER_VIDEO * vids + PER_CARD * cards) * 100
+    return max(cents, min_cents, 50)
+
+
+def _spec_from_inputs(inputs: dict) -> dict | None:
+    """Map an accepted proposal's spec (which arrives as task.inputs) into a ProductionSpec dict."""
+    if not any(k in inputs for k in ("images", "image_count", "videos", "cards", "card_count", "platforms", "video_kinds")):
+        return None
+    raw_v = inputs.get("videos")
+    if isinstance(raw_v, list):
+        kinds = [v.get("kind") if isinstance(v, dict) else str(v) for v in raw_v]
+    elif inputs.get("video_kinds"):
+        kinds = list(inputs["video_kinds"])
+    else:
+        kinds = ["360", "voiceover", "ugc", "macro"][: int(raw_v or 0)]
+    videos = [{"kind": k, "aspect_ratio": "9:16", "duration_seconds": 8} for k in kinds if k]
+    return {
+        "platforms": inputs.get("platforms") or [],
+        "image_count": max(1, min(int(inputs.get("images") or inputs.get("image_count") or 6), 20)),
+        "image_aspect_ratios": inputs.get("image_aspect_ratios") or ["4:5", "1:1"],
+        "videos": videos,
+        "card_count": max(0, min(int(inputs.get("cards") or inputs.get("card_count") or 0), 5)),
+        "card_aspect_ratio": "4:5",
+        "copy_channels": inputs.get("platforms") or ["instagram"],
+        "language": inputs.get("language") or "",
+        "mood": inputs.get("mood") or "",
+    }
+
+
+_CONSULT_SYS = (
+    'You are the order consultant for "Lumina — Product Content Studio", an AI agent that turns a '
+    "product PHOTO + brief into a complete on-brand content package: photorealistic product images "
+    "(hero/macro/lifestyle/flat-lay/e-commerce), short videos (360° spin, voiceover ad, UGC, macro), "
+    "designed product cards, and multi-variant marketing copy — faithful to the real product and the "
+    "brand.\n"
+    "You chat with a potential buyer to agree the SCOPE and PRICE of their order.\n"
+    "RULES:\n"
+    "- Reply in the SAME LANGUAGE as the buyer's latest message.\n"
+    "- ONE short, friendly, expert reply (<= ~600 chars).\n"
+    "- To deliver we NEED the buyer's product PHOTO — if no product image URL was given/uploaded, ask "
+    "for it (a direct image URL is ideal).\n"
+    "- Gather target platform(s) (Instagram/TikTok/Amazon/web…) and rough volume (images, videos, "
+    "cards). Infer sensible defaults from the platform; don't over-ask.\n"
+    "- PRICING: base $29 + $4/image + $12/video + $6/card. Quote with this exact formula.\n"
+    "- On the FIRST turn or when key info is missing, just CLARIFY (propose=false) UNLESS mode is "
+    "'price'. When you have platform + rough scope, OR mode is 'price', PROPOSE a concrete plan.\n"
+    "Return STRICT JSON: {\n"
+    '  "text": "<reply to the buyer, in their language; if proposing, summarize scope + total price '
+    'and ask them to confirm>",\n'
+    '  "propose": <true only when proposing a concrete plan now, else false>,\n'
+    '  "spec": null OR {"platforms":[..],"images":<int>,"videos":<int>,"cards":<int>,'
+    '"image_aspect_ratios":[..],"video_kinds":[..],"brief":"<one line>",'
+    '"product_image_url":"<url or empty>","language":"<buyer language>","mood":"<optional>"},\n'
+    '  "etaMinutes": <int 10-40>\n}'
+)
+
+
+def _consult_reply(consult: dict) -> dict:
+    """Run one consultation turn and return the marketplace consult reply JSON."""
+    mode = consult.get("mode") or "interview"
+    message = consult.get("message") or ""
+    history = consult.get("history") or []
+    pricing = consult.get("pricing") or {}
+    min_cents = int(pricing.get("minPriceCents") or 0)
+
+    lines = [f"{h.get('sender', 'user')}: {h.get('text', '')}" for h in history[-12:]]
+    if message and (not history or history[-1].get("text") != message):
+        lines.append(f"user: {message}")
+    convo = "\n".join(lines) or "(no messages yet)"
+
+    fallback = "Tell me about your product and where you'll publish it — I'll put together a package."
+    try:
+        resp = gemini_client().models.generate_content(
+            model=settings.model_reasoning,
+            contents=f"{_CONSULT_SYS}\n\nConversation so far:\n{convo}\n\nCurrent consult mode: {mode}",
+            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=2048),
+        )
+        data = json.loads(resp.text)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+
+    text = (data.get("text") or "").strip()[:6000] or fallback
+    out: dict = {"text": text}
+    spec = data.get("spec") if isinstance(data.get("spec"), dict) else None
+    if (bool(data.get("propose")) or mode == "price") and spec:
+        cents = _quote_cents(spec, min_cents)
+        eta = int(data.get("etaMinutes") or 30)
+        eta = min(40, max(10, eta))
+        out["proposal"] = {"spec": spec, "quoteCents": cents, "etaMinutes": eta}
+        if mode == "price":
+            out["suggestedPriceCents"] = cents
+    return out
+
+
+@app.get("/api/marketplace/webhook")
+def marketplace_health():
+    """Liveness/validation ping for the marketplace (no auth — reveals nothing sensitive)."""
+    return {"status": "ok", "service": "lumina", "configured": bool(MARKETPLACE_TOKEN)}
+
+
+@app.post("/api/marketplace/webhook")
+async def marketplace_webhook(request: Request, authorization: str = Header(default="")):
+    """Receive a task from the marketplace (Simple Webhook v1).
+
+    Verifies the bearer token. A real order (product image present) runs asynchronously and the
+    finished package is POSTed to callback.url; a handshake/sample task (no product image) is
+    completed synchronously so connection verification passes.
+    """
+    if not _bearer_ok(authorization):
+        raise HTTPException(401, "invalid token")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    escrow.log_inbound(payload if isinstance(payload, dict) else {"_list": payload})
+
+    # Consultation chat (v1.1): reply synchronously with text (+ optional one-click proposal).
+    # Run the blocking LLM call off the event loop; keep well under the platform's 20s limit.
+    if payload.get("event") == "consult.message" or isinstance(payload.get("consult"), dict):
+        return await asyncio.to_thread(_consult_reply, payload.get("consult") or {})
+
+    inputs = (payload.get("task") or {}).get("inputs") or {}
+    callback = payload.get("callback") or {}
+    cb_url, cb_token = callback.get("url") or "", callback.get("bearerToken") or ""
+
+    image_url = _first(inputs, ["product_image_url", "image_url", "image", "product_photo", "photo", "product_image"])
+    brief = _first(inputs, ["brief", "description", "prompt", "topic", "task", "instructions", "details"])
+    brand_link = _first(inputs, ["brand_link", "brand_url", "website", "url"])
+
+    # No product image -> handshake/sample: complete synchronously so verification passes.
+    if not image_url:
+        return {
+            "status": "completed",
+            "outputs": {
+                "markdown": "Lumina is connected. Send a task with `product_image_url` + `brief` to "
+                            "receive a full on-brand content package (images, videos, cards, copy).",
+                "echo_inputs": inputs,
+            },
+        }
+
+    # Real order: long-running -> accept now, deliver the package via callback.
+    threading.Thread(
+        target=lambda: asyncio.run(
+            _run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token)),
+        daemon=True,
+    ).start()
+    return {"status": "accepted"}
+
+
+@app.get("/api/marketplace/inbound")
+def marketplace_inbound(token: str = ""):
+    """Token-gated: inspect the most recent captured payloads (to map the marketplace's contract)."""
+    if not _bearer_ok("Bearer " + token):
+        raise HTTPException(401, "unauthorized")
+    return {"recent": escrow.recent_inbound(5)}
 
 
 @app.post("/api/jobs")
@@ -80,18 +347,64 @@ def accept(jid: str):
     return {"ok": True}
 
 
+def _content_type(blob_path: str) -> str:
+    low = blob_path.lower()
+    if low.endswith(".mp4"):
+        return "video/mp4"
+    if low.endswith(".webp"):
+        return "image/webp"
+    if low.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    return "image/png"
+
+
 @app.get("/api/asset")
-def asset(uri: str):
-    """Proxy a gs:// asset through ADC so the browser needn't have GCS access."""
+def asset(uri: str, request: Request):
+    """Proxy a gs:// asset through ADC so the browser needn't have GCS access.
+
+    Supports HTTP Range requests (206 Partial Content) — required for <video> playback,
+    seeking and download in browsers (Safari/iOS won't play a video without range support).
+    """
     if not uri.startswith("gs://"):
         raise HTTPException(400, "bad uri")
     bucket_name, _, blob_path = uri[5:].partition("/")
     blob = storage.Client(project=settings.project).bucket(bucket_name).blob(blob_path)
-    if not blob.exists():
+    try:
+        blob.reload()  # populate size; raises NotFound if the object is missing
+    except NotFound:
         raise HTTPException(404, "asset not found")
+    size = blob.size or 0
+    ctype = _content_type(blob_path)
+    base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600"}
+
+    range_header = request.headers.get("range")
+    if range_header and range_header.startswith("bytes=") and size:
+        spec = range_header[len("bytes="):].split(",")[0].strip()
+        start_s, _, end_s = spec.partition("-")
+        try:
+            if not start_s and end_s:  # suffix range: last N bytes
+                start, end = max(0, size - int(end_s)), size - 1
+            else:
+                start = int(start_s) if start_s else 0
+                end = int(end_s) if end_s else size - 1
+        except ValueError:
+            raise HTTPException(416, "invalid range")
+        start, end = max(0, start), min(end, size - 1)
+        if start > end:
+            raise HTTPException(416, "range not satisfiable")
+        chunk = blob.download_as_bytes(start=start, end=end)  # end is inclusive in GCS
+        headers = {
+            **base_headers,
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Length": str(len(chunk)),
+        }
+        return Response(content=chunk, status_code=206, media_type=ctype, headers=headers)
+
     data = blob.download_as_bytes()
-    ctype = "video/mp4" if blob_path.lower().endswith(".mp4") else "image/png"
-    return Response(content=data, media_type=ctype)
+    return Response(
+        content=data, media_type=ctype,
+        headers={**base_headers, "Content-Length": str(len(data))},
+    )
 
 
 async def _run_job(jid: str, brief: str, product_uri: str) -> None:
@@ -99,7 +412,8 @@ async def _run_job(jid: str, brief: str, product_uri: str) -> None:
     try:
         runner = InMemoryRunner(agent=root_agent, app_name="lumina_mkt")
         session = await runner.session_service.create_session(
-            app_name="lumina_mkt", user_id=jid, state={"product_image_uri": product_uri}
+            app_name="lumina_mkt", user_id=jid,
+            state={"product_image_uri": product_uri, "brief_text": brief},
         )
         msg = types.Content(role="user", parts=[types.Part(text=brief)])
         seen: set[str] = set()
@@ -214,9 +528,12 @@ async function poll(){
   if(sc.length){ $('#scorecard').classList.remove('hidden'); $('#scorecard').innerHTML = '<div class="font-medium text-sm">Quality scorecard</div>' + sc.map((s,i)=>'<div class="text-xs flex justify-between border-b border-stone-100 py-1"><span>'+(s.verdict==='pass'?'✓':'✗')+' Asset '+(i+1)+'</span><span class="font-mono text-stone-500">'+Math.round((s.score||0)*100)+'%</span></div>').join(''); }
   if(j.package){
     const a = j.package.assets || [];
-    $('#gallery').innerHTML = a.map(x => x.type==='video'
-      ? `<video controls class="rounded-lg w-full" src="/api/asset?uri=${encodeURIComponent(x.uri)}"></video>`
-      : `<img class="rounded-lg w-full" src="/api/asset?uri=${encodeURIComponent(x.uri)}">`).join('');
+    $('#gallery').innerHTML = a.map((x,i) => {
+      const src = '/api/asset?uri=' + encodeURIComponent(x.uri);
+      return x.type==='video'
+        ? `<div class="space-y-1"><video controls playsinline preload="metadata" class="rounded-lg w-full bg-black" src="${src}"></video><a href="${src}" download="lumina-video-${i+1}.mp4" class="block text-xs text-stone-500 underline">⬇ Download MP4</a></div>`
+        : `<div class="space-y-1"><img class="rounded-lg w-full" src="${src}"><a href="${src}" download="lumina-${i+1}.png" class="block text-xs text-stone-500 underline">⬇ Download</a></div>`;
+    }).join('');
     const cp = j.package.copy;
     if(cp){ $('#copy').classList.remove('hidden');
       let h = '<div class="font-medium text-sm">Marketing copy</div>';

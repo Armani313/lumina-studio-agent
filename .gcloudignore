@@ -10,4 +10,5 @@ outputs/
 .env
 test_remote.py
 run_slice.py
+test_video_clips.py
 marketplace/smoke_test.py

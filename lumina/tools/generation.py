@@ -150,6 +150,35 @@ def render_image_bytes(
     return None
 
 
+def render_image_from_prompt(
+    prompt: str,
+    aspect_ratio: str = "4:5",
+    product_uri: str | None = None,
+    model: str | None = None,
+):
+    """Generate one image from a VERBATIM prompt (the caller supplies the full art direction — no
+    photography wrapper is added). Attaches the product reference image when given. Returns
+    (bytes, mime) or None. Used for fully designed compositions like product cards."""
+    contents: list = []
+    if product_uri:
+        contents.append(types.Part.from_uri(file_uri=product_uri, mime_type=mime_for_uri(product_uri)))
+    contents.append(types.Part(text=prompt))
+    resp = _image_generate_with_retry(
+        contents,
+        types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+        ),
+        model=model,
+    )
+    for cand in resp.candidates or []:
+        for part in (cand.content.parts or []):
+            inline = getattr(part, "inline_data", None)
+            if inline and inline.data:
+                return inline.data, (inline.mime_type or "image/png")
+    return None
+
+
 def generate_lifestyle_image(
     scene_description: str,
     aspect_ratio: str = "1:1",

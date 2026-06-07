@@ -10,9 +10,11 @@ shot_planner_agent = LlmAgent(
     description="Turns a creative brief into a small shot list and a copy plan.",
     instruction=(
         f"You are the shot planner. Using the creative brief, the live brand research, and the "
-        f"retrieved brand guidelines below, plan exactly {settings.image_count} distinct lifestyle "
-        f"shots across the brief's channels, each with an appropriate aspect ratio (instagram 4:5, "
-        f"stories 9:16, amazon 1:1, web hero 16:9). Make the SET genuinely varied: assign each shot a "
+        f"retrieved brand guidelines below, plan the lifestyle shots for THIS order. If a production "
+        f"spec is provided below, produce EXACTLY its image_count shots, each using ONE of the spec's "
+        f"image_aspect_ratios and tuned to the spec's platforms; otherwise default to "
+        f"{settings.image_count} shots with appropriate ratios (instagram 4:5, stories 9:16, amazon "
+        f"1:1, web hero 16:9). Make the SET genuinely varied: assign each shot a "
         f"distinct shot_type and cover a range — include at least one 'hero', plus a mix of 'macro' "
         f"(extreme close-up of texture/detail), 'lifestyle' (real-world context), 'flatlay' (styled "
         f"top-down), 'ecommerce' (clean/seamless background) and 'on_model' where the category fits. "
@@ -23,6 +25,7 @@ shot_planner_agent = LlmAgent(
         f"the category shot strategy below. Write each scene_description like a professional "
         f"photographer's art-direction (lighting setup, lens/angle, composition, props, mood). "
         f"Choose one primary copy_channel.\n\n"
+        "Production spec (honor image_count, image_aspect_ratios, platforms):\n{spec?}\n\n"
         "Product category: {product_category?}\n"
         "Shot strategy for this category:\n{shot_strategy?}\n\n"
         "Suggested settings for THIS product:\n{suggested_settings?}\n\n"

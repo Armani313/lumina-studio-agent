@@ -40,7 +40,8 @@ async def main() -> None:
 
     runner = InMemoryRunner(agent=root_agent, app_name="lumina")
     session = await runner.session_service.create_session(
-        app_name="lumina", user_id="demo", state={"product_image_uri": product_uri}
+        app_name="lumina", user_id="demo",
+        state={"product_image_uri": product_uri, "brief_text": DESCRIPTION},
     )
     message = types.Content(role="user", parts=[types.Part(text=DESCRIPTION)])
 

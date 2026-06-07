@@ -25,12 +25,16 @@ copywriter_agent = LlmAgent(
     model=settings.model_reasoning,
     description="Writes channel marketing copy in the brand voice.",
     instruction=(
-        "You are the copywriter. Call generate_copy once for the plan's copy_channel, using "
-        "the brief's product_name, key_features and brand_voice, and pass language set to the "
-        "brief's language so the copy is in the user's language. Ground the copy in the ACTUAL "
-        "product below — never claim features the product does not have. Then reply with the "
-        "returned copy as JSON.\n\nBrief:\n{brief}\n\nActual product (from photo):\n"
-        "{product_description?}\n\nPlan:\n{plan}"
+        "You are the copywriter. Call generate_copy once for the channel = the production spec's "
+        "first copy_channel (or the plan's copy_channel if no spec), using the "
+        "brief's product_name and key_features. For brand_voice, COMBINE the brief's brand_voice "
+        "with the brand's real tone/identity from the brand research below, so the copy matches the "
+        "customer's actual brand. Pass language set to the brief's language so the copy is in the "
+        "user's language. Ground the copy in the ACTUAL product below — never claim features the "
+        "product does not have. Then reply with the returned copy as JSON.\n\nBrief:\n{brief}\n\n"
+        "Actual product (from photo):\n{product_description?}\n\n"
+        "Production spec (use its copy_channels):\n{spec?}\n\n"
+        "Brand research (honor its tone/voice):\n{brand_research?}\n\nPlan:\n{plan}"
     ),
     tools=[generate_copy],
     output_key="copy_doc",
