@@ -73,6 +73,32 @@ def _first(d: dict, keys: list[str]) -> str:
     return ""
 
 
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _image_from_attachments(attachments: object) -> str:
+    """Return the first image attachment's URL.
+
+    The external marketplace delivers the buyer's product photo as an entry in
+    `task.attachments[]` (orders) or `consult.attachments[]` (chat) — NOT in
+    `inputs.product_image_url`, which it sends empty. We must read it from here.
+    """
+    if not isinstance(attachments, list):
+        return ""
+    for a in attachments:
+        if not isinstance(a, dict):
+            continue
+        url = a.get("url") or a.get("href") or a.get("downloadUrl") or ""
+        if not url or not isinstance(url, str):
+            continue
+        mime = (a.get("mimeType") or a.get("contentType") or a.get("type") or "").lower()
+        name = (a.get("name") or a.get("filename") or "").lower()
+        path = url.split("?", 1)[0].lower()
+        if mime.startswith("image/") or name.endswith(_IMG_EXTS) or path.endswith(_IMG_EXTS):
+            return url
+    return ""
+
+
 def _proxy_url(gs_uri: str) -> str:
     return f"{SERVICE_URL}/api/asset?uri=" + urllib.parse.quote(gs_uri, safe="")
 
@@ -120,18 +146,36 @@ def _build_outputs(state: dict) -> dict:
 
 
 async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_link: str,
-                               cb_url: str, cb_token: str) -> None:
-    """Background: run the full agent for an external-marketplace task, then POST the result."""
+                               cb_url: str, cb_token: str, delivery_id: str = "") -> None:
+    """Background: run the full agent for an external-marketplace task, then POST the result.
+
+    Always finishes with exactly one callback: {status: "completed", outputs} once real assets
+    exist, otherwise {status: "failed", error}. Never reports a hollow completion.
+    """
+    tag = f"[mkt-job {delivery_id or '-'}]"
+
+    def _cb(body: dict) -> None:
+        if delivery_id:
+            body.setdefault("deliveryId", delivery_id)
+        extra = f" error={body['error']!r}" if body.get("status") == "failed" else ""
+        print(f"{tag} -> callback status={body.get('status')}{extra}", flush=True)
+        _post_callback(cb_url, cb_token, body)
+
+    print(f"{tag} start image_url={(image_url or '')[:90]!r} brief={(brief or '')[:80]!r}", flush=True)
     try:
+        if not image_url:
+            _cb({"status": "failed", "error": "no product image in task inputs or attachments"})
+            return
         product_uri = _fetch_image_to_gcs(image_url)
         if not product_uri:
-            _post_callback(cb_url, cb_token, {"status": "failed", "error": "could not fetch product image"})
+            _cb({"status": "failed", "error": "could not fetch product image"})
             return
         full_brief = brief if not brand_link else f"{brief}\nBrand link: {brand_link}"
         seed = {"product_image_uri": product_uri, "brief_text": full_brief, "brand_link": brand_link}
         spec = _spec_from_inputs(inputs)
         if spec:
             seed["spec"] = spec
+        print(f"{tag} fetched product->gcs; running agent (spec={'yes' if spec else 'no'})", flush=True)
         runner = InMemoryRunner(agent=root_agent, app_name="lumina_ext")
         uid = uuid.uuid4().hex
         session = await runner.session_service.create_session(app_name="lumina_ext", user_id=uid, state=seed)
@@ -140,9 +184,18 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
             pass
         st = dict((await runner.session_service.get_session(
             app_name="lumina_ext", user_id=uid, session_id=session.id)).state)
-        _post_callback(cb_url, cb_token, {"status": "completed", "outputs": _build_outputs(st)})
+        outputs = _build_outputs(st)
+        print(f"{tag} agent done; assets images={len(outputs.get('images') or [])} "
+              f"cards={len(outputs.get('cards') or [])} videos={len(outputs.get('videos') or [])}", flush=True)
+        # Guard: never report a hollow "completed" with no media (the original failure class).
+        if not (outputs.get("images") or outputs.get("videos") or outputs.get("cards")):
+            _cb({"status": "failed", "error": "generation produced no deliverable assets"})
+            return
+        _cb({"status": "completed", "outputs": outputs})
     except Exception as e:  # noqa: BLE001
-        _post_callback(cb_url, cb_token, {"status": "failed", "error": str(e)[:300]})
+        import traceback
+        print(f"{tag} EXCEPTION {e!r}\n{traceback.format_exc()}", flush=True)
+        _cb({"status": "failed", "error": str(e)[:300]})
 
 
 def _quote_cents(spec: dict, min_cents: int = 0) -> int:
@@ -215,17 +268,23 @@ def _consult_reply(consult: dict) -> dict:
     history = consult.get("history") or []
     pricing = consult.get("pricing") or {}
     min_cents = int(pricing.get("minPriceCents") or 0)
+    photo_url = _image_from_attachments(consult.get("attachments"))
 
     lines = [f"{h.get('sender', 'user')}: {h.get('text', '')}" for h in history[-12:]]
     if message and (not history or history[-1].get("text") != message):
         lines.append(f"user: {message}")
     convo = "\n".join(lines) or "(no messages yet)"
+    photo_note = (
+        "\n\nNOTE: The buyer has ALREADY attached their product photo to this conversation. "
+        "Treat the product image as PROVIDED — do NOT ask for a product image URL."
+        if photo_url else ""
+    )
 
     fallback = "Tell me about your product and where you'll publish it — I'll put together a package."
     try:
         resp = gemini_client().models.generate_content(
             model=settings.model_reasoning,
-            contents=f"{_CONSULT_SYS}\n\nConversation so far:\n{convo}\n\nCurrent consult mode: {mode}",
+            contents=f"{_CONSULT_SYS}\n\nConversation so far:\n{convo}\n\nCurrent consult mode: {mode}{photo_note}",
             config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=2048),
         )
         data = json.loads(resp.text)
@@ -238,6 +297,9 @@ def _consult_reply(consult: dict) -> dict:
     out: dict = {"text": text}
     spec = data.get("spec") if isinstance(data.get("spec"), dict) else None
     if (bool(data.get("propose")) or mode == "price") and spec:
+        # Carry the attached photo into the proposal so the accepted task arrives with a usable image.
+        if photo_url and not spec.get("product_image_url"):
+            spec["product_image_url"] = photo_url
         cents = _quote_cents(spec, min_cents)
         eta = int(data.get("etaMinutes") or 30)
         eta = min(40, max(10, eta))
@@ -254,12 +316,22 @@ def marketplace_health():
 
 
 @app.post("/api/marketplace/webhook")
-async def marketplace_webhook(request: Request, authorization: str = Header(default="")):
-    """Receive a task from the marketplace (Simple Webhook v1).
+async def marketplace_webhook(
+    request: Request,
+    authorization: str = Header(default=""),
+    x_docs: str = Header(default=""),
+):
+    """Receive an event from the marketplace (Simple Webhook v1.1).
 
-    Verifies the bearer token. A real order (product image present) runs asynchronously and the
-    finished package is POSTed to callback.url; a handshake/sample task (no product image) is
-    completed synchronously so connection verification passes.
+    Event routing (contract link arrives in the X-Docs request header):
+      • consult.message                      -> synchronous text reply (+ optional proposal)
+      • task.test / connection check         -> synchronous "connected" stub (the ONLY stub)
+      • task.created / task.revision_requested (real orders)
+            -> respond {status: "accepted"} now; the finished package is POSTed to
+               callback.url (Bearer callback.bearerToken) within the offer's ETA.
+
+    A real order is NEVER answered with the "connected" stub, and a synchronous
+    {status: "completed"} is only ever returned for the test handshake.
     """
     if not _bearer_ok(authorization):
         raise HTTPException(401, "invalid token")
@@ -267,36 +339,58 @@ async def marketplace_webhook(request: Request, authorization: str = Header(defa
         payload = await request.json()
     except Exception:
         payload = {}
-    escrow.log_inbound(payload if isinstance(payload, dict) else {"_list": payload})
+    if not isinstance(payload, dict):
+        payload = {"_list": payload}
+    # Persist the contract link (X-Docs) with the body so we can verify the exact schema later.
+    escrow.log_inbound({**payload, "_xdocs": x_docs} if x_docs else payload)
 
-    # Consultation chat (v1.1): reply synchronously with text (+ optional one-click proposal).
+    event = str(payload.get("event") or "").lower()
+
+    # Consultation chat: reply synchronously with text (+ optional one-click proposal).
     # Run the blocking LLM call off the event loop; keep well under the platform's 20s limit.
-    if payload.get("event") == "consult.message" or isinstance(payload.get("consult"), dict):
+    if event == "consult.message" or isinstance(payload.get("consult"), dict):
         return await asyncio.to_thread(_consult_reply, payload.get("consult") or {})
 
-    inputs = (payload.get("task") or {}).get("inputs") or {}
-    callback = payload.get("callback") or {}
-    cb_url, cb_token = callback.get("url") or "", callback.get("bearerToken") or ""
-
-    image_url = _first(inputs, ["product_image_url", "image_url", "image", "product_photo", "photo", "product_image"])
-    brief = _first(inputs, ["brief", "description", "prompt", "topic", "task", "instructions", "details"])
-    brand_link = _first(inputs, ["brand_link", "brand_url", "website", "url"])
-
-    # No product image -> handshake/sample: complete synchronously so verification passes.
-    if not image_url:
+    # Connection test / handshake: the ONLY event answered synchronously as "completed".
+    if event in ("task.test", "test", "connection.test", "ping") or bool(payload.get("test")):
         return {
             "status": "completed",
             "outputs": {
-                "markdown": "Lumina is connected. Send a task with `product_image_url` + `brief` to "
-                            "receive a full on-brand content package (images, videos, cards, copy).",
-                "echo_inputs": inputs,
+                "markdown": "Lumina is connected and ready. Place a real order with a product "
+                            "photo to receive a full on-brand content package — photorealistic "
+                            "images, short videos, product cards and marketing copy.",
             },
         }
 
-    # Real order: long-running -> accept now, deliver the package via callback.
+    task = payload.get("task") or {}
+    inputs = task.get("inputs") or {}
+    callback = payload.get("callback") or {}
+    cb_url, cb_token = callback.get("url") or "", callback.get("bearerToken") or ""
+    delivery_id = payload.get("deliveryId") or task.get("id") or ""
+
+    # Per the platform contract the buyer's photo is delivered as a task ATTACHMENT; inputs may
+    # carry a placeholder (e.g. "user_uploaded_image") or nothing, so the attachment is the source
+    # of truth. Only fall back to an inputs value when it's an actual http(s) URL.
+    image_url = _image_from_attachments(task.get("attachments"))
+    if not image_url:
+        candidate = _first(inputs, ["product_image_url", "image_url", "image", "product_photo", "photo", "product_image"])
+        if candidate.startswith(("http://", "https://")):
+            image_url = candidate
+    brief = _first(inputs, ["brief", "description", "prompt", "topic", "task", "instructions", "details"])
+    brand_link = _first(inputs, ["brand_link", "brand_url", "website", "url"])
+    # On a revision request, fold the buyer's feedback into the brief so the re-run addresses it.
+    revision = _first(task, ["revisionInstructions", "revision_instructions", "feedback"])
+    if revision:
+        brief = f"{brief}\n\nRevision requested by buyer: {revision}".strip()
+
+    # Anything with no order signal (no task/inputs/attachments) is acknowledged, never faked.
+    if not (image_url or inputs or task.get("attachments")):
+        return {"status": "ignored", "note": f"no actionable order in event '{event or 'unknown'}'"}
+
+    # Real order: long-running -> accept now; deliver (or report failure) via async callback.
     threading.Thread(
         target=lambda: asyncio.run(
-            _run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token)),
+            _run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token, delivery_id)),
         daemon=True,
     ).start()
     return {"status": "accepted"}
