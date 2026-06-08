@@ -27,9 +27,10 @@ from google.adk.runners import InMemoryRunner
 from lumina.agent import root_agent
 from lumina.clients import gemini_client
 from lumina.config import settings
-from lumina.pricing import BASE_PRICE, PER_CARD, PER_IMAGE, PER_VIDEO
+from lumina.pricing import BASE_PRICE, PER_CARD, PER_IMAGE, PER_VIDEO, default_spec, price_for_spec
 from lumina.tools.delivery import mime_for_uri, upload_bytes
 
+from . import consult as consult_engine
 from . import escrow
 from .a2a_server import a2a_app
 
@@ -233,77 +234,29 @@ def _spec_from_inputs(inputs: dict) -> dict | None:
     }
 
 
-_CONSULT_SYS = (
-    'You are the order consultant for "Lumina — Product Content Studio", an AI agent that turns a '
-    "product PHOTO + brief into a complete on-brand content package: photorealistic product images "
-    "(hero/macro/lifestyle/flat-lay/e-commerce), short videos (360° spin, voiceover ad, UGC, macro), "
-    "designed product cards, and multi-variant marketing copy — faithful to the real product and the "
-    "brand.\n"
-    "You chat with a potential buyer to agree the SCOPE and PRICE of their order.\n"
-    "RULES:\n"
-    "- Reply in the SAME LANGUAGE as the buyer's latest message.\n"
-    "- ONE short, friendly, expert reply (<= ~600 chars).\n"
-    "- To deliver we NEED the buyer's product PHOTO — if no product image URL was given/uploaded, ask "
-    "for it (a direct image URL is ideal).\n"
-    "- Gather target platform(s) (Instagram/TikTok/Amazon/web…) and rough volume (images, videos, "
-    "cards). Infer sensible defaults from the platform; don't over-ask.\n"
-    "- PRICING: base $29 + $4/image + $12/video + $6/card. Quote with this exact formula.\n"
-    "- On the FIRST turn or when key info is missing, just CLARIFY (propose=false) UNLESS mode is "
-    "'price'. When you have platform + rough scope, OR mode is 'price', PROPOSE a concrete plan.\n"
-    "Return STRICT JSON: {\n"
-    '  "text": "<reply to the buyer, in their language; if proposing, summarize scope + total price '
-    'and ask them to confirm>",\n'
-    '  "propose": <true only when proposing a concrete plan now, else false>,\n'
-    '  "spec": null OR {"platforms":[..],"images":<int>,"videos":<int>,"cards":<int>,'
-    '"image_aspect_ratios":[..],"video_kinds":[..],"brief":"<one line>",'
-    '"product_image_url":"<url or empty>","language":"<buyer language>","mood":"<optional>"},\n'
-    '  "etaMinutes": <int 10-40>\n}'
-)
-
-
 def _consult_reply(consult: dict) -> dict:
-    """Run one consultation turn and return the marketplace consult reply JSON."""
+    """One consultation turn for the EXTERNAL marketplace, via the content-aware engine.
+
+    The engine studies the buyer's attached photo and any shared link live, then replies (+ an
+    optional proposal). Live study is bounded so the synchronous reply stays within the platform's
+    ~20s budget. Response shape is unchanged: {text, proposal?, suggestedPriceCents?}.
+    """
     mode = consult.get("mode") or "interview"
     message = consult.get("message") or ""
     history = consult.get("history") or []
-    pricing = consult.get("pricing") or {}
-    min_cents = int(pricing.get("minPriceCents") or 0)
+    min_cents = int((consult.get("pricing") or {}).get("minPriceCents") or 0)
     photo_url = _image_from_attachments(consult.get("attachments"))
 
-    lines = [f"{h.get('sender', 'user')}: {h.get('text', '')}" for h in history[-12:]]
-    if message and (not history or history[-1].get("text") != message):
-        lines.append(f"user: {message}")
-    convo = "\n".join(lines) or "(no messages yet)"
-    photo_note = (
-        "\n\nNOTE: The buyer has ALREADY attached their product photo to this conversation. "
-        "Treat the product image as PROVIDED — do NOT ask for a product image URL."
-        if photo_url else ""
-    )
+    result = consult_engine.run_consult(message, history, photo_url=photo_url, mode=mode, deadline_s=11.0)
 
-    fallback = "Tell me about your product and where you'll publish it — I'll put together a package."
-    try:
-        resp = gemini_client().models.generate_content(
-            model=settings.model_reasoning,
-            contents=f"{_CONSULT_SYS}\n\nConversation so far:\n{convo}\n\nCurrent consult mode: {mode}{photo_note}",
-            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=2048),
-        )
-        data = json.loads(resp.text)
-        if not isinstance(data, dict):
-            data = {}
-    except Exception:
-        data = {}
-
-    text = (data.get("text") or "").strip()[:6000] or fallback
-    out: dict = {"text": text}
-    spec = data.get("spec") if isinstance(data.get("spec"), dict) else None
-    if (bool(data.get("propose")) or mode == "price") and spec:
+    out: dict = {"text": result["text"]}
+    spec = result.get("spec")
+    if result.get("propose") and spec:
         # Carry the attached photo into the proposal so the accepted task arrives with a usable image.
         if photo_url and not spec.get("product_image_url"):
             spec["product_image_url"] = photo_url
         cents = _quote_cents(spec, min_cents)
-        eta = int(data.get("etaMinutes") or 30)
-        eta = min(40, max(10, eta))
-        out["proposal"] = {"spec": spec, "quoteCents": cents, "etaMinutes": eta}
+        out["proposal"] = {"spec": spec, "quoteCents": cents, "etaMinutes": result.get("etaMinutes") or 30}
         if mode == "price":
             out["suggestedPriceCents"] = cents
     return out
@@ -417,7 +370,7 @@ async def create_job(
         data, f"inputs/{uuid.uuid4().hex}.png", mime_for_uri(product_photo.filename or ".png")
     )
     brief = description if not brand_link else f"{description}\nBrand link: {brand_link}"
-    jid = escrow.create_job(brief, uri, brand_link, price=49)
+    jid = escrow.create_job(brief, uri, brand_link, price=price_for_spec(default_spec()))
     # Run the agent in a separate thread+loop so its blocking tool calls (image/video gen)
     # never freeze the web event loop serving the UI/polling.
     threading.Thread(
@@ -439,6 +392,71 @@ def accept(jid: str):
     if not escrow.accept_job(jid):
         raise HTTPException(400, "job not in Delivered state")
     return {"ok": True}
+
+
+@app.post("/api/consult")
+async def consult_turn(
+    message: str = Form(""),
+    history: str = Form("[]"),
+    photo: UploadFile = File(None),
+    photo_uri: str = Form(""),
+):
+    """Studio-UI chat turn. Studies any shared photo/link LIVE, returns the consultant's reply and,
+    when ready, a one-click proposal. The photo is uploaded once; the client resends photo_uri after.
+    """
+    try:
+        hist = json.loads(history) if history else []
+        if not isinstance(hist, list):
+            hist = []
+    except Exception:
+        hist = []
+    if photo is not None:
+        data = await photo.read()
+        if data:
+            photo_uri = upload_bytes(
+                data, f"inputs/{uuid.uuid4().hex}.png", mime_for_uri(photo.filename or ".png")
+            )
+    msg = message or ("(shared a product photo)" if photo is not None else message)
+    # Our own UI — no 20s cap, so allow a fuller live study of photo + links.
+    result = await asyncio.to_thread(
+        consult_engine.run_consult, msg, hist, (photo_uri or None), "interview", 40.0
+    )
+    out: dict = {
+        "text": result["text"],
+        "photo_uri": photo_uri,
+        "studied": (result.get("studied") or {}).get("chip", ""),
+    }
+    spec = result.get("spec")
+    if result.get("propose") and spec:
+        if photo_uri and not spec.get("product_image_url"):
+            spec["product_image_url"] = photo_uri
+        out["proposal"] = {
+            "spec": spec,
+            "price": _quote_cents(spec, 0) // 100,
+            "etaMinutes": result.get("etaMinutes") or 30,
+        }
+    return out
+
+
+@app.post("/api/consult/start")
+async def consult_start(request: Request):
+    """Lock the agreed plan into a funded job and start the agent (reuses the order pipeline)."""
+    body = await request.json()
+    spec = body.get("spec") if isinstance(body.get("spec"), dict) else {}
+    photo_uri = (body.get("photo_uri") or "").strip()
+    if not photo_uri:
+        raise HTTPException(400, "no product photo")
+    brief = (spec.get("brief") or "").strip() or "On-brand content package for the uploaded product."
+    brand_link = (spec.get("brand_link") or "").strip()
+    if brand_link:
+        brief = f"{brief}\nBrand link: {brand_link}"
+    norm = _spec_from_inputs(spec)
+    price = _quote_cents(spec, 0) // 100
+    jid = escrow.create_job(brief, photo_uri, brand_link, price=price)
+    threading.Thread(
+        target=lambda: asyncio.run(_run_job(jid, brief, photo_uri, norm)), daemon=True
+    ).start()
+    return {"job_id": jid}
 
 
 def _content_type(blob_path: str) -> str:
@@ -624,13 +642,15 @@ def _narrate_event(ev, seen: set[str]) -> list[tuple[str, str]]:
     return out
 
 
-async def _run_job(jid: str, brief: str, product_uri: str) -> None:
+async def _run_job(jid: str, brief: str, product_uri: str, spec: dict | None = None) -> None:
     """Background: run the full agent graph for this order and record the result + escrow state."""
     try:
         runner = InMemoryRunner(agent=root_agent, app_name="lumina_mkt")
+        state = {"product_image_uri": product_uri, "brief_text": brief}
+        if spec:
+            state["spec"] = spec  # honor the plan agreed in the consultation chat
         session = await runner.session_service.create_session(
-            app_name="lumina_mkt", user_id=jid,
-            state={"product_image_uri": product_uri, "brief_text": brief},
+            app_name="lumina_mkt", user_id=jid, state=state,
         )
         msg = types.Content(role="user", parts=[types.Part(text=brief)])
         seen: set[str] = set()
@@ -668,26 +688,21 @@ INDEX_HTML = """<!doctype html>
 <body class="bg-stone-100 text-stone-800">
 <div class="max-w-3xl mx-auto p-6">
   <h1 class="text-2xl font-semibold tracking-tight">Lumina Studio <span class="text-stone-400">— hire the agent</span></h1>
-  <p class="text-sm text-stone-500 mt-1">Upload a product photo, fund escrow, and the autonomous studio delivers an on-brand content package.</p>
+  <p class="text-sm text-stone-500 mt-1">Chat with the studio: share your product photo and a link to your site or design — the agent studies them, agrees a plan, then delivers an on-brand content package.</p>
 
-  <form id="orderForm" class="mt-6 bg-white rounded-xl shadow-sm p-5 space-y-4">
-    <div>
-      <label class="block text-sm font-medium">Product photo</label>
-      <input name="product_photo" type="file" accept="image/*" required class="mt-1 block w-full text-sm">
-    </div>
-    <div>
-      <label class="block text-sm font-medium">Brief / description</label>
-      <textarea name="description" rows="3" required class="mt-1 w-full rounded-lg border-stone-300 border p-2 text-sm"
-        placeholder="Brand, product, key features, target channel…"></textarea>
-    </div>
-    <div>
-      <label class="block text-sm font-medium">Brand link (optional)</label>
-      <input name="brand_link" type="url" class="mt-1 w-full rounded-lg border-stone-300 border p-2 text-sm" placeholder="https://…">
-    </div>
-    <button class="bg-stone-800 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-stone-700">
-      Order &amp; fund escrow ($49)
-    </button>
-  </form>
+  <div id="chat" class="mt-6 bg-white rounded-xl shadow-sm p-5">
+    <div id="messages" class="space-y-3 max-h-[28rem] overflow-auto pr-1"></div>
+    <div id="studied" class="mt-2 text-[11px] text-stone-400"></div>
+    <div id="proposal" class="mt-3 hidden"></div>
+    <div id="attachRow" class="mt-3 hidden text-xs text-stone-500"></div>
+    <form id="chatForm" class="mt-3 flex items-end gap-2">
+      <label class="shrink-0 cursor-pointer rounded-lg border border-stone-300 px-3 py-2 text-sm hover:bg-stone-50" title="Attach product photo">
+        📎<input id="photo" type="file" accept="image/*" class="hidden">
+      </label>
+      <textarea id="msg" rows="1" class="flex-1 resize-none rounded-lg border-stone-300 border p-2 text-sm" placeholder="Describe your product and where you'll publish it…"></textarea>
+      <button id="sendBtn" class="shrink-0 bg-stone-800 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-stone-700">Send</button>
+    </form>
+  </div>
 
   <div id="job" class="mt-6 hidden bg-white rounded-xl shadow-sm p-5">
     <div class="flex items-center justify-between">
@@ -731,17 +746,101 @@ function evMark(k){
   return '<span class="text-stone-300">• </span>';
 }
 
-$('#orderForm').addEventListener('submit', async (e) => {
+// ---- Consultation chat ----
+const history = [];
+let photoUri = '';
+let pendingPhoto = null;
+
+function bubble(sender, text){
+  const mine = sender === 'user';
+  const w = document.createElement('div');
+  w.className = 'flex ' + (mine ? 'justify-end' : 'justify-start');
+  w.innerHTML = '<div class="max-w-[80%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap '+(mine?'bg-stone-800 text-white':'bg-stone-100 text-stone-800')+'">'+escapeHtml(text)+'</div>';
+  $('#messages').appendChild(w);
+  $('#messages').scrollTop = $('#messages').scrollHeight;
+}
+function typing(on){
+  let t = document.getElementById('typing');
+  if(on && !t){ t=document.createElement('div'); t.id='typing'; t.className='flex justify-start';
+    t.innerHTML='<div class="rounded-2xl px-3 py-2 text-sm bg-stone-100 text-stone-400">…</div>';
+    $('#messages').appendChild(t); $('#messages').scrollTop=$('#messages').scrollHeight; }
+  else if(!on && t){ t.remove(); }
+}
+
+$('#photo').addEventListener('change', () => {
+  pendingPhoto = $('#photo').files[0] || null;
+  $('#attachRow').classList.toggle('hidden', !pendingPhoto);
+  $('#attachRow').textContent = pendingPhoto ? ('📎 '+pendingPhoto.name+' — sent with your next message') : '';
+});
+$('#msg').addEventListener('keydown', (e) => {
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); $('#chatForm').requestSubmit(); }
+});
+
+$('#chatForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const r = await fetch('/api/jobs', { method: 'POST', body: new FormData(e.target) });
-  const j = await r.json();
-  jid = j.job_id;
-  window.__t0 = Date.now();
+  const text = $('#msg').value.trim();
+  if(!text && !pendingPhoto) return;
+  const shown = text || '📎 (product photo)';
+  bubble('user', shown);
+  $('#msg').value = '';
+  $('#proposal').classList.add('hidden');
+  $('#sendBtn').disabled = true; typing(true);
+
+  const fd = new FormData();
+  fd.append('message', text);
+  fd.append('history', JSON.stringify(history));
+  if(pendingPhoto) fd.append('photo', pendingPhoto);
+  if(photoUri) fd.append('photo_uri', photoUri);
+  history.push({sender:'user', text: shown});
+
+  let j;
+  try { j = await (await fetch('/api/consult', {method:'POST', body: fd})).json(); }
+  catch(err){ typing(false); $('#sendBtn').disabled=false; bubble('agent','(connection error — please try again)'); return; }
+  typing(false); $('#sendBtn').disabled=false;
+  pendingPhoto = null; $('#photo').value=''; $('#attachRow').classList.add('hidden');
+  if(j.photo_uri) photoUri = j.photo_uri;
+  bubble('agent', j.text || '…');
+  history.push({sender:'agent', text: j.text || ''});
+  $('#studied').textContent = j.studied ? ('🔎 '+j.studied) : '';
+  if(j.proposal) renderProposal(j.proposal);
+});
+
+function renderProposal(p){
+  const s = p.spec || {};
+  const vids = Array.isArray(s.video_kinds) ? s.video_kinds.length : (s.videos||0);
+  const parts = [];
+  if(s.images) parts.push(s.images+' images');
+  if(vids) parts.push(vids+' video'+(vids>1?'s':''));
+  if(s.cards) parts.push(s.cards+' card'+(s.cards>1?'s':''));
+  const plat = (s.platforms&&s.platforms.length) ? ' — '+escapeHtml(s.platforms.join(', ')) : '';
+  $('#proposal').classList.remove('hidden');
+  $('#proposal').innerHTML =
+    '<div class="rounded-xl border border-stone-200 p-3">'+
+      '<div class="text-sm font-medium text-stone-800">Proposed plan</div>'+
+      '<div class="text-sm text-stone-600 mt-1">'+escapeHtml(parts.join(' · ')||'Custom package')+plat+'</div>'+
+      '<div class="mt-2 flex items-center justify-between">'+
+        '<div class="text-lg font-semibold">$'+(p.price||0)+'</div>'+
+        '<button id="startBtn" class="bg-emerald-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-emerald-500">Start &amp; fund escrow</button>'+
+      '</div></div>';
+  $('#startBtn').addEventListener('click', () => startOrder(s));
+}
+
+async function startOrder(spec){
+  if(!photoUri){ bubble('agent','Please attach your product photo first, then I can start.'); return; }
+  const b = $('#startBtn'); b.disabled = true; b.textContent = 'Starting…';
+  let j;
+  try { j = await (await fetch('/api/consult/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({spec, photo_uri: photoUri})})).json(); }
+  catch(err){ b.disabled=false; b.textContent='Start & fund escrow'; return; }
+  if(!j.job_id){ b.disabled=false; b.textContent='Start & fund escrow'; return; }
+  jid = j.job_id; window.__t0 = Date.now();
+  $('#chat').classList.add('hidden');
   $('#job').classList.remove('hidden');
   $('#jid').textContent = jid;
-  poll();
-  timer = setInterval(poll, 3000);
-});
+  poll(); timer = setInterval(poll, 3000);
+}
+
+bubble('agent', "Hi! I'm your Lumina content consultant. Tell me about your product and where you'll publish it — attach your product photo and paste a link to your site or design, and I'll study them and put together a plan.");
+history.push({sender:'agent', text:"Hi! I'm your Lumina content consultant."});
 
 function badge(el, text, cls){ el.textContent = text; el.className = 'text-xs px-2 py-1 rounded-full ' + cls; }
 

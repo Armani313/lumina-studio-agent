@@ -28,7 +28,7 @@ consultant_agent = LlmAgent(
         "  • web → 16:9 & 4:5 images, a '360' video 16:9, copy for website\n"
         "Video kinds you can offer: '360' (orbit), 'voiceover' (narrated ad), 'ugc' (handheld), "
         "'macro' (extreme close-up).\n"
-        "Pricing (so you can guide budget): base $29 + $4/image + $12/video + $6/card.\n"
+        "Pricing (so you can guide budget): base $7 + $1/image + $2/video + $1/card.\n"
         "Be efficient and decisive: once the customer confirms, OR if they give no preferences / say "
         "'just do it' after you have proposed a concrete plan, CALL finalize_plan with the agreed "
         "values. Sensible defaults if unspecified: 6 images (4:5 & 1:1), a '360' + a 'voiceover', 2 "

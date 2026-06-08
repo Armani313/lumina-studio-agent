@@ -6,10 +6,10 @@ the marketplace quotes a price from it (base + per-asset) before funding escrow.
 from __future__ import annotations
 
 # Per-item pricing (USD). Quote = BASE + per-image + per-video + per-card.
-BASE_PRICE = 29
-PER_IMAGE = 4
-PER_VIDEO = 12
-PER_CARD = 6
+BASE_PRICE = 7
+PER_IMAGE = 1
+PER_VIDEO = 2
+PER_CARD = 1
 
 
 def price_for_spec(spec: dict) -> int:
