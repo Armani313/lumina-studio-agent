@@ -501,6 +501,129 @@ def asset(uri: str, request: Request):
     )
 
 
+# --- "Agent thinking" narration ---------------------------------------------
+# Turn raw ADK events (agent authors, tool calls, tool responses, reasoning text)
+# into a human-readable live log so a watcher can follow HOW the studio reasons,
+# not just opaque stage/tool identifiers.
+_STAGE_LABELS = {
+    "product_vision": "👁️ Studying your product photo",
+    "intake": "📋 Reading your brief",
+    "grounding": "🔎 Researching your brand",
+    "brand_research": "🔎 Reading your site & searching the web",
+    "brand_rag": "📚 Recalling brand guidelines",
+    "shot_planner": "🎬 Art-directing the shoot",
+    "production": "🎨 Producing your content",
+    "image_production": "🖼️ Shooting product images",
+    "copywriter": "✍️ Writing marketing copy",
+    "video_production": "🎥 Filming product videos",
+    "card_production": "🪧 Designing product cards",
+    "qa_loop": "🔍 Quality control",
+    "brand_qa": "🔍 Checking brand fit & fidelity",
+    "delivery": "📦 Packaging your delivery",
+}
+
+
+def _stage_label(author: str) -> str:
+    return _STAGE_LABELS.get(author) or ("🤖 " + author.replace("_", " ").title())
+
+
+def _short(v: object, n: int = 80) -> str:
+    s = " ".join(str(v).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _narrate_call(name: str, args: dict) -> str | None:
+    """Plain-language line for a tool the agent just decided to use."""
+    a = args or {}
+    if name == "describe_product":
+        return "inspecting the photo to identify the exact product"
+    if name == "generate_lifestyle_image":
+        shot = a.get("shot_type") or "lifestyle"
+        ar = a.get("aspect_ratio") or ""
+        return f"rendering a {shot} shot" + (f" · {ar}" if ar else "")
+    if name == "generate_copy":
+        ch = a.get("channel") or "social"
+        lang = a.get("language") or ""
+        return f"writing {ch} copy" + (f" in {lang}" if lang else "")
+    if name == "generate_product_video":
+        ar = a.get("aspect_ratio") or ""
+        dur = a.get("duration_seconds")
+        bits = " · ".join(x for x in (ar, f"{dur}s" if dur else "") if x)
+        return "filming a product clip" + (f" ({bits})" if bits else "")
+    if name == "make_product_card":
+        h = a.get("headline")
+        return "designing a product card" + (f": “{_short(h, 42)}”" if h else "")
+    if name == "review_image_brand_fit":
+        return "reviewing an image for brand fit & product fidelity"
+    if name == "replace_failed_image":
+        return "regenerating an image that needs work"
+    if name == "exit_loop":
+        return "approving — every image passed QA"
+    if name == "write_manifest":
+        return "writing the delivery manifest"
+    if name in ("google_search", "google_search_retrieval"):
+        return "searching the web"
+    if name == "url_context":
+        return "reading the brand’s website"
+    return f"using {name.replace('_', ' ')}"
+
+
+def _narrate_response(name: str, resp: object) -> tuple[str, str] | None:
+    """(kind, line) for a tool RESULT — only the few high-signal ones worth surfacing."""
+    r = resp if isinstance(resp, dict) else {}
+    inner = r.get("result")
+    if isinstance(inner, dict) and not (r.keys() & {"verdict", "old_uri", "status", "error"}):
+        r = inner
+    if name == "review_image_brand_fit":
+        verdict = str(r.get("verdict") or "").lower()
+        score = r.get("score")
+        pct = f"{round(float(score) * 100)}%" if isinstance(score, (int, float)) else ""
+        if verdict == "pass":
+            return ("verdict", "✓ on-brand" + (f" · {pct}" if pct else ""))
+        issues = r.get("issues") or []
+        why = _short(issues[0], 70) if issues else _short(r.get("fix_suggestion") or "", 70)
+        return ("verdict-fail", "✗ needs work" + (f" · {pct}" if pct else "") + (f" — {why}" if why else ""))
+    if name == "replace_failed_image":
+        if r.get("error"):
+            return ("verdict-fail", "regeneration failed — retrying")
+        return ("verdict", "✓ swapped in a corrected image")
+    if name == "exit_loop":
+        return ("verdict", "✓ package approved")
+    return None
+
+
+def _narrate_event(ev, seen: set[str]) -> list[tuple[str, str]]:
+    """One ADK event -> zero or more (kind, message) lines for the live thinking log."""
+    out: list[tuple[str, str]] = []
+    author = getattr(ev, "author", None) or "agent"
+    if author not in seen:
+        seen.add(author)
+        out.append(("stage", _stage_label(author)))
+    content = getattr(ev, "content", None)
+    for p in (getattr(content, "parts", None) or []):
+        fc = getattr(p, "function_call", None)
+        if fc and getattr(fc, "name", None):
+            line = _narrate_call(fc.name, dict(getattr(fc, "args", None) or {}))
+            if line:
+                out.append(("act", line))
+            continue
+        fr = getattr(p, "function_response", None)
+        if fr and getattr(fr, "name", None):
+            r = _narrate_response(fr.name, getattr(fr, "response", None))
+            if r:
+                out.append(r)
+            continue
+        text = getattr(p, "text", None)
+        if text and not getattr(ev, "partial", False):
+            t = text.strip()
+            if getattr(p, "thought", False):  # Gemini's own reasoning summary (BuiltInPlanner)
+                if t:
+                    out.append(("reason", _short(t, 300)))
+            elif t and t[0] not in "{[":  # skip raw JSON echoes (structured agent outputs)
+                out.append(("think", _short(t, 160)))
+    return out
+
+
 async def _run_job(jid: str, brief: str, product_uri: str) -> None:
     """Background: run the full agent graph for this order and record the result + escrow state."""
     try:
@@ -511,17 +634,15 @@ async def _run_job(jid: str, brief: str, product_uri: str) -> None:
         )
         msg = types.Content(role="user", parts=[types.Part(text=brief)])
         seen: set[str] = set()
+        last: tuple[str, str] | None = None
+        # Narrate the agent's work as a human-readable "thinking" log: friendly stage headers,
+        # the model's own reasoning summaries, plain-language tool actions and QA verdicts.
         async for ev in runner.run_async(user_id=jid, session_id=session.id, new_message=msg):
-            a = getattr(ev, "author", None) or "agent"
-            if a not in seen:
-                seen.add(a)
-                escrow.add_event(jid, f"stage: {a}")
-            # Granular sub-progress (esp. during the long QA loop) so the UI never looks frozen.
-            if ev.content and ev.content.parts:
-                for p in ev.content.parts:
-                    fc = getattr(p, "function_call", None)
-                    if fc and getattr(fc, "name", None):
-                        escrow.add_event(jid, f"  {a} → {fc.name}")
+            for kind, line in _narrate_event(ev, seen):
+                if (kind, line) == last:
+                    continue  # collapse consecutive duplicates (model re-emits prose across chunks)
+                last = (kind, line)
+                escrow.add_event(jid, line, kind=kind)
         s = await runner.session_service.get_session(
             app_name="lumina_mkt", user_id=jid, session_id=session.id
         )
@@ -576,8 +697,11 @@ INDEX_HTML = """<!doctype html>
         <span id="escrow" class="text-xs px-2 py-1 rounded-full bg-amber-100 text-amber-800"></span>
       </div>
     </div>
-    <div id="now" class="mt-3 text-sm text-stone-700 flex items-center gap-2"></div>
-    <ol id="events" class="mt-2 text-xs text-stone-400 space-y-1 max-h-40 overflow-auto"></ol>
+    <div id="now" class="mt-3 text-sm text-stone-700 flex items-center gap-2 flex-wrap"></div>
+    <div id="thinking" class="mt-3 hidden">
+      <div class="text-[11px] uppercase tracking-wide text-stone-400 font-medium">Agent thinking</div>
+      <ol id="events" class="mt-1 text-xs leading-relaxed space-y-0.5 max-h-64 overflow-auto pr-1"></ol>
+    </div>
     <div id="copy" class="mt-4 text-sm hidden"></div>
     <div id="scorecard" class="mt-4 hidden"></div>
     <div id="gallery" class="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-3"></div>
@@ -590,6 +714,22 @@ INDEX_HTML = """<!doctype html>
 <script>
 const $ = (s) => document.querySelector(s);
 let jid = null, timer = null;
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function evClass(k){ return ({
+  stage: 'text-stone-800 font-medium mt-2',
+  reason: 'text-violet-600 pl-4',
+  act: 'text-stone-500 pl-4',
+  verdict: 'text-emerald-600 pl-4',
+  'verdict-fail': 'text-amber-600 pl-4',
+  think: 'text-stone-500 italic pl-4',
+})[k] || 'text-stone-400'; }
+function evMark(k){
+  if(k==='reason') return '<span class="text-violet-300">💭 </span>';
+  if(k==='act') return '<span class="text-stone-300">↳ </span>';
+  if(k==='stage'||k==='verdict'||k==='verdict-fail'||k==='think') return '';
+  return '<span class="text-stone-300">• </span>';
+}
 
 $('#orderForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -613,11 +753,22 @@ async function poll(){
         j.status==='Failed' ? 'bg-red-100 text-red-700' : 'bg-stone-200 text-stone-700');
   badge($('#escrow'), 'escrow: ' + j.escrow, j.escrow==='Released' ? 'bg-emerald-100 text-emerald-800' :
         j.escrow==='Refunded' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-800');
-  $('#events').innerHTML = (j.events||[]).map(e => '<li>• ' + e.msg + '</li>').join('');
+  const evs = j.events || [];
+  $('#thinking').classList.toggle('hidden', evs.length === 0);
+  $('#events').innerHTML = evs.map(e => '<li class="'+evClass(e.kind||'system')+'">'+evMark(e.kind||'system')+escapeHtml(e.msg)+'</li>').join('');
+  const evBox = $('#events'); evBox.scrollTop = evBox.scrollHeight;  // keep newest in view
   const inProg = j.status==='InProgress';
-  const lastEv = (j.events||[]).slice(-1)[0];
+  const lastEv = evs[evs.length-1];
+  let lastStage = null; for(let i=evs.length-1;i>=0;i--){ if((evs[i].kind||'')==='stage'){ lastStage = evs[i]; break; } }
   const elapsed = Math.floor((Date.now()-(window.__t0||Date.now()))/1000);
-  $('#now').innerHTML = (inProg ? '<span class="inline-block h-3 w-3 border-2 border-stone-400 border-t-transparent rounded-full animate-spin"></span>' : '') + '<span>'+(lastEv?lastEv.msg:'')+'</span>' + (inProg?' <span class="text-stone-400">· '+elapsed+'s</span>':'');
+  const spin = '<span class="inline-block h-3 w-3 border-2 border-stone-400 border-t-transparent rounded-full animate-spin"></span>';
+  const head = lastStage ? lastStage.msg : (lastEv ? lastEv.msg : '');
+  const subRaw = (lastEv && lastEv !== lastStage) ? lastEv.msg : '';
+  const sub = subRaw.length > 100 ? subRaw.slice(0, 99) + '…' : subRaw;
+  $('#now').innerHTML = (inProg ? spin : '') +
+    '<span class="font-medium text-stone-800">'+escapeHtml(head)+'</span>' +
+    (sub ? ' <span class="text-stone-400">— '+escapeHtml(sub)+'</span>' : '') +
+    (inProg ? ' <span class="text-stone-400">· '+elapsed+'s</span>' : '');
   const sc = (j.package && j.package.qa_scores) || [];
   if(sc.length){ $('#scorecard').classList.remove('hidden'); $('#scorecard').innerHTML = '<div class="font-medium text-sm">Quality scorecard</div>' + sc.map((s,i)=>'<div class="text-xs flex justify-between border-b border-stone-100 py-1"><span>'+(s.verdict==='pass'?'✓':'✗')+' Asset '+(i+1)+'</span><span class="font-mono text-stone-500">'+Math.round((s.score||0)*100)+'%</span></div>').join(''); }
   if(j.package){

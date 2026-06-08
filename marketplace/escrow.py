@@ -48,7 +48,7 @@ def create_job(brief: str, product_image_uri: str, brand_link: str, price: int) 
             "escrow": FUNDED,
             "package": None,
             "created_at": _now(),
-            "events": [{"t": _now(), "msg": "Order funded; escrow held; dispatched to agent"}],
+            "events": [{"t": _now(), "msg": "Order funded; escrow held; dispatched to agent", "kind": "system"}],
         }
     )
     return jid
@@ -63,9 +63,9 @@ def update_job(jid: str, **fields) -> None:
     db().collection(JOBS).document(jid).update(fields)
 
 
-def add_event(jid: str, msg: str) -> None:
+def add_event(jid: str, msg: str, kind: str = "system") -> None:
     db().collection(JOBS).document(jid).update(
-        {"events": firestore.ArrayUnion([{"t": _now(), "msg": msg}])}
+        {"events": firestore.ArrayUnion([{"t": _now(), "msg": msg, "kind": kind}])}
     )
 
 

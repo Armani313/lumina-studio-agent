@@ -4,7 +4,7 @@
 """
 from google.adk.agents import LlmAgent, SequentialAgent
 
-from ..models import reasoning_model
+from ..models import reasoning_model, thinking_planner
 from .cards import card_production_agent
 from .delivery import delivery_agent
 from .intake import intake_agent
@@ -35,9 +35,13 @@ root_agent = SequentialAgent(
 
 
 def _apply_retry(agent) -> None:
-    """Give every LlmAgent a retry-enabled model so a transient 429/quota spike doesn't fail a stage."""
+    """Give every LlmAgent a retry-enabled model (so a transient 429/quota spike doesn't fail a
+    stage) and, when enabled, a thinking planner that surfaces the model's reasoning summaries."""
     if isinstance(agent, LlmAgent):
         agent.model = reasoning_model()
+        planner = thinking_planner()
+        if planner is not None:
+            agent.planner = planner
     for sub in getattr(agent, "sub_agents", None) or []:
         _apply_retry(sub)
 
