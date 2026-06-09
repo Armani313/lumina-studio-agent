@@ -112,7 +112,10 @@ def study_image(url_or_uri: str) -> dict:
         resp = gemini_client().models.generate_content(
             model=settings.model_reasoning,
             contents=[part, types.Part(text=_IMG_STUDY_PROMPT)],
-            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=1024),
+            # gemini-3.5-flash is a THINKING model — thinking tokens are drawn from this budget, so a
+            # tight cap can make it emit EMPTY text (all budget spent thinking) and look like the photo
+            # "couldn't be read". Give the same headroom vision.py uses for image analysis.
+            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=3072),
         )
         data = _parse_json(resp.text)
         res = {
@@ -155,7 +158,9 @@ def study_page(url: str) -> dict:
             contents=_PAGE_STUDY_PROMPT.format(url=url),
             config=types.GenerateContentConfig(
                 tools=[types.Tool(url_context=types.UrlContext())],
-                max_output_tokens=1024,
+                # Thinking model + url_context retrieval + JSON all draw on this budget; a tight cap
+                # makes the model return EMPTY and report the page as unreadable even when it loaded.
+                max_output_tokens=4096,
             ),
         )
         data = _parse_json(resp.text)
@@ -327,6 +332,31 @@ _SYSTEM = (
 )
 
 
+def _graceful_fallback(message: str, history: list[dict]) -> str:
+    """Last-resort reply when the model returns nothing usable.
+
+    Stays in the customer's language and, mid-conversation, does NOT reset to the cold-open greeting
+    (which reads as the agent forgetting everything that was discussed). Only a true first contact
+    gets the "tell me about your product" invite.
+    """
+    ru = sum(1 for c in (message or "") if "Ѐ" <= c <= "ӿ") >= 3
+    if len(history) < 2:  # genuine first contact — invite the product photo + a link
+        return (
+            "Расскажите о вашем продукте и где будете его публиковать — пришлите фото товара и ссылку "
+            "на ваш сайт или дизайн, и я соберу план."
+            if ru else
+            "Tell me about your product and where you'll publish it — share your product photo and a "
+            "link to your site or design, and I'll put together a plan."
+        )
+    return (  # mid-chat: keep context, ask them to restate the last message rather than starting over
+        "Секунду — кажется, я потерял нить. Повторите, пожалуйста, последнее сообщение, "
+        "и я сразу обновлю расчёт."
+        if ru else
+        "Sorry — I lost the thread for a second. Could you repeat that last bit, and I'll update the "
+        "plan right away?"
+    )
+
+
 def run_consult(
     message: str,
     history: list[dict],
@@ -355,18 +385,26 @@ def run_consult(
         "and share a link to their site/branding/design)."
     )
 
-    fallback = "Tell me about your product and where you'll publish it — share your product photo and a link to your site or design, and I'll put together a plan."
     try:
         resp = gemini_client().models.generate_content(
             model=settings.model_reasoning,
             contents=f"{_SYSTEM}{studied_block}\n\nConversation so far:\n{convo}\n\nCurrent consult mode: {mode}",
-            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=2048),
+            # gemini-3.5-flash is a THINKING model: thinking tokens are drawn from this same budget, so
+            # a tight cap makes a harder turn (e.g. re-scoping an agreed plan — "drop the videos") spend
+            # everything on thinking and emit EMPTY text. That silently collapsed to the cold-open
+            # fallback, making the agent look like it forgot the whole conversation. In test mode we
+            # give the discussion generous headroom so a reply never gets starved mid-thought.
+            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=16384),
         )
         data = _parse_json(resp.text)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        print(f"[consult] dialogue model error: {e!r}", flush=True)
         data = {}
 
-    text = (data.get("text") or "").strip()[:6000] or fallback
+    text = (data.get("text") or "").strip()[:6000]
+    if not text:  # empty/garbled model output — degrade gracefully WITHOUT dumping the cold greeting
+        print(f"[consult] empty dialogue text -> graceful fallback (history_turns={len(history)})", flush=True)
+        text = _graceful_fallback(message, history)
     spec = data.get("spec") if isinstance(data.get("spec"), dict) else None
     # DISCUSS FIRST: only propose (→ escrow offer) when there's real substance — a product photo, a
     # studied product, or an actual back-and-forth. The platform sends mode=="price" on EVERY turn

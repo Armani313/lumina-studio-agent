@@ -799,12 +799,17 @@ function bubble(sender, text){
   $('#messages').appendChild(w);
   $('#messages').scrollTop = $('#messages').scrollHeight;
 }
-function typing(on){
+function typing(on, label){
   let t = document.getElementById('typing');
-  if(on && !t){ t=document.createElement('div'); t.id='typing'; t.className='flex justify-start';
-    t.innerHTML='<div class="rounded-2xl px-3 py-2 text-sm bg-stone-100 text-stone-400">…</div>';
-    $('#messages').appendChild(t); $('#messages').scrollTop=$('#messages').scrollHeight; }
-  else if(!on && t){ t.remove(); }
+  if(on){
+    if(!t){ t=document.createElement('div'); t.id='typing'; t.className='flex justify-start';
+      $('#messages').appendChild(t); }
+    // With a label (e.g. "studying your photo…") show a live status so the chat never sits empty
+    // while we analyse the photo/link; without one, the plain typing dots.
+    t.innerHTML='<div class="rounded-2xl px-3 py-2 text-sm bg-stone-100 '+(label?'text-stone-500':'text-stone-400')+'">'+
+      (label?'<span class="animate-pulse">'+escapeHtml(label)+'</span>':'…')+'</div>';
+    $('#messages').scrollTop=$('#messages').scrollHeight;
+  } else if(t){ t.remove(); }
 }
 
 $('#photo').addEventListener('change', () => {
@@ -824,7 +829,15 @@ $('#chatForm').addEventListener('submit', async (e) => {
   bubble('user', shown);
   $('#msg').value = '';
   $('#proposal').classList.add('hidden');
-  $('#sendBtn').disabled = true; typing(true);
+  // Acknowledge instantly so the chat never goes empty while we study the photo/link (study can take
+  // several seconds). Content-aware + language-aware (Cyrillic in this or recent turns -> Russian).
+  const ru = /[Ѐ-ӿ]/.test(text) || /[Ѐ-ӿ]/.test(history.map(h=>h.text||'').join(' '));
+  const hasLink = new RegExp('https?://', 'i').test(text);
+  let studyMsg = '';
+  if(pendingPhoto && hasLink) studyMsg = ru ? '📸🔎 Смотрю ваше фото и открываю ссылку…' : '📸🔎 Looking at your photo and opening your link…';
+  else if(pendingPhoto)       studyMsg = ru ? '📸 Секунду, рассматриваю ваше фото…'       : '📸 One sec — studying your photo…';
+  else if(hasLink)            studyMsg = ru ? '🔎 Открываю ссылку, изучаю стиль…'          : '🔎 Opening your link, studying the style…';
+  $('#sendBtn').disabled = true; typing(true, studyMsg);
 
   const fd = new FormData();
   fd.append('message', text);
