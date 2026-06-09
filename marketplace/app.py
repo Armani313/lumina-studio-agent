@@ -146,6 +146,54 @@ def _build_outputs(state: dict) -> dict:
     return {"markdown": "\n\n".join(md), "images": images, "cards": cards, "videos": videos, "copy": copy}
 
 
+# --- Background agent jobs share ONE long-lived event loop ------------------
+# A dedicated daemon thread owns a single event loop that is never closed; every order/consult job
+# is submitted to it. ADK caches its async genai client on the process-wide singleton agent model
+# (Gemini.api_client is a @cached_property bound to the loop it was first used on). Running each job
+# via asyncio.run(...) created a fresh loop per job and CLOSED it on completion, leaving that cached
+# client bound to a dead loop — so the second order onward failed with "Event loop is closed". A
+# persistent loop keeps the client valid for the life of the process; blocking tool calls
+# (image/video gen) still run off the web event loop, so the UI/polling never freezes.
+_job_loop: asyncio.AbstractEventLoop | None = None
+_job_loop_lock = threading.Lock()
+
+
+def _get_job_loop() -> asyncio.AbstractEventLoop:
+    global _job_loop
+    with _job_loop_lock:
+        if _job_loop is None:
+            loop = asyncio.new_event_loop()
+
+            def _serve() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            threading.Thread(target=_serve, name="lumina-jobs", daemon=True).start()
+            _job_loop = loop
+    return _job_loop
+
+
+def _dispatch(coro) -> None:
+    """Run a background agent job on the shared loop (keeps blocking work off the web loop).
+
+    _run_job / _run_marketplace_job handle their own exceptions; the done-callback only fires for
+    unexpected errors outside those guards, which we log instead of swallowing silently.
+    """
+    fut = asyncio.run_coroutine_threadsafe(coro, _get_job_loop())
+
+    def _log_unhandled(f) -> None:
+        try:
+            exc = f.exception()
+        except Exception:  # noqa: BLE001 — cancelled future, etc.
+            return
+        if exc is not None:
+            import traceback
+            print("[job] unhandled exception:\n"
+                  + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
+
+    fut.add_done_callback(_log_unhandled)
+
+
 async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_link: str,
                                cb_url: str, cb_token: str, delivery_id: str = "") -> None:
     """Background: run the full agent for an external-marketplace task, then POST the result.
@@ -341,11 +389,7 @@ async def marketplace_webhook(
         return {"status": "ignored", "note": f"no actionable order in event '{event or 'unknown'}'"}
 
     # Real order: long-running -> accept now; deliver (or report failure) via async callback.
-    threading.Thread(
-        target=lambda: asyncio.run(
-            _run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token, delivery_id)),
-        daemon=True,
-    ).start()
+    _dispatch(_run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token, delivery_id))
     return {"status": "accepted"}
 
 
@@ -371,11 +415,9 @@ async def create_job(
     )
     brief = description if not brand_link else f"{description}\nBrand link: {brand_link}"
     jid = escrow.create_job(brief, uri, brand_link, price=price_for_spec(default_spec()))
-    # Run the agent in a separate thread+loop so its blocking tool calls (image/video gen)
+    # Run the agent on the shared background loop so its blocking tool calls (image/video gen)
     # never freeze the web event loop serving the UI/polling.
-    threading.Thread(
-        target=lambda: asyncio.run(_run_job(jid, brief, uri)), daemon=True
-    ).start()
+    _dispatch(_run_job(jid, brief, uri))
     return {"job_id": jid}
 
 
@@ -453,9 +495,7 @@ async def consult_start(request: Request):
     norm = _spec_from_inputs(spec)
     price = _quote_cents(spec, 0) // 100
     jid = escrow.create_job(brief, photo_uri, brand_link, price=price)
-    threading.Thread(
-        target=lambda: asyncio.run(_run_job(jid, brief, photo_uri, norm)), daemon=True
-    ).start()
+    _dispatch(_run_job(jid, brief, photo_uri, norm))
     return {"job_id": jid}
 
 
