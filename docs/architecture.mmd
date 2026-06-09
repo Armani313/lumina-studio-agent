@@ -1,36 +1,71 @@
-flowchart TD
-  U(["Product photo + brief"]) --> ROOT
-  subgraph ROOT["SequentialAgent: lumina_pipeline"]
+---
+title: "Lumina — AI-Agent Marketplace with Escrow"
+---
+flowchart TB
+
+  subgraph MP["AI-Agent Marketplace · Cloud Run + Firestore"]
     direction TB
-    INT["intake LlmAgent<br/>output_schema CreativeBrief"] --> GND
-    subgraph GND["ParallelAgent: grounding"]
-      direction LR
-      RES["brand_research<br/>tool google_search"]
-      RAG["brand_rag<br/>tool VertexAiSearchTool"]
-    end
-    GND --> PLAN["shot_planner LlmAgent<br/>output_schema ShotPlan, N shots"]
-    PLAN --> PROD
-    subgraph PROD["ParallelAgent: production"]
-      direction LR
-      IMG["image_production xN<br/>generate_lifestyle_image<br/>image-conditioned on product"]
-      COPY["copywriter<br/>generate_copy"]
-      VID["video_production<br/>generate_product_video, Veo"]
-    end
-    PROD --> CARD["card_production LlmAgent<br/>make_product_card x2"]
-    CARD --> QA
-    subgraph QA["LoopAgent: qa_loop, max 2"]
-      BQA["brand_qa LlmAgent<br/>review fidelity and brand,<br/>regenerate, exit_loop"]
-    end
-    QA --> DEL["delivery LlmAgent<br/>write_manifest"]
+    BUYER(["Buyer / brand"])
+    CON["Consultation (content-aware)<br/>vision + url_context · agrees scope and price"]
+    ESC{{"Escrow ledger · Firestore<br/>Funded → In Progress → Delivered → Released / Refunded"}}
+    ORCH["Order orchestrator"]
+    DLV["Delivery<br/>images · videos · cards · copy"]
+    BUYER -->|"photo + brief + brand link"| CON
+    CON -->|"priced proposal"| ESC
+    ESC -->|"funded, start job"| ORCH
+    ORCH -->|"finished package"| DLV
+    DLV -->|"buyer accepts, release"| ESC
   end
 
-  RES -. "google_search" .-> WEB(("Web"))
-  RAG -. "retrieve" .-> VS[("Vertex AI Search:<br/>aurelia-brand-kb")]
-  IMG -- "images" --> GCS[("Cloud Storage")]
-  CARD -- "cards" --> GCS
-  VID -- "video" --> GCS
-  BQA -. "read and compare" .-> GCS
-  DEL -- "manifest" --> GCS
-  INT -. "Gemini 3.x, global" .-> VX[("Vertex / Gemini Enterprise<br/>Agent Platform")]
-  IMG -. "Nano Banana, global" .-> VX
-  VID -. "Veo, us-central1" .-> VX
+  EXT["External marketplaces<br/>and other AI agents"]
+  EXT <-->|"Simple Webhook v1.1 + A2A AgentCard"| MP
+
+  ORCH ==>|"run order"| ROOT
+  subgraph ROOT["Lumina Agent · Google ADK — Sequential · Parallel · Loop"]
+    direction TB
+    VIS["product_vision<br/>see and classify the product"] --> INT["intake<br/>CreativeBrief"]
+    INT --> GND
+    subgraph GND["grounding · Parallel"]
+      direction LR
+      RES["brand_research<br/>google_search"]
+      RAG["brand_rag<br/>Vertex AI Search RAG"]
+    end
+    GND --> PLAN["shot_planner<br/>ShotPlan"]
+    PLAN --> PROD
+    subgraph PROD["production · Parallel"]
+      direction LR
+      IMG["image_production ×N<br/>conditioned on product"]
+      COPY["copywriter<br/>multi-variant copy"]
+      VID["video_production<br/>Veo"]
+    end
+    PROD --> CARD["card_production ×2<br/>styled selling cards"]
+    CARD --> QA
+    subgraph QA["qa_loop · Loop ≤2"]
+      BQA["brand_qa<br/>fidelity + brand, regenerate"]
+    end
+    QA --> MAN["delivery<br/>assemble + manifest"]
+  end
+  MAN ==>|"package + scorecard"| DLV
+
+  RES -. "search" .-> WEB(("Web"))
+  RAG -. "retrieve" .-> VS[("Vertex AI Search<br/>brand KB")]
+  INT -. "Gemini 3.x · global" .-> VX[("Vertex AI<br/>Gemini · Veo")]
+  IMG -. "Gemini image" .-> VX
+  VID -. "Veo · us-central1" .-> VX
+  IMG --> GCS[("Cloud Storage")]
+  VID --> GCS
+  CARD --> GCS
+  MAN --> GCS
+  BQA -. "compare" .-> GCS
+
+  classDef store fill:#f3f4f6,stroke:#9ca3af,color:#111827;
+  classDef ext fill:#fff7ed,stroke:#f59e0b,color:#111827;
+  class WEB,VS,VX,GCS store;
+  class EXT ext;
+  style MP fill:#eef2ff,stroke:#6366f1,color:#111827;
+  style ROOT fill:#ecfeff,stroke:#06b6d4,color:#111827;
+  style GND fill:#ffffff,stroke:#a5b4fc,color:#111827;
+  style PROD fill:#ffffff,stroke:#a5b4fc,color:#111827;
+  style QA fill:#ffffff,stroke:#a5b4fc,color:#111827;
+  style BUYER fill:#ffffff,stroke:#6366f1,color:#111827;
+  style ESC fill:#fef9c3,stroke:#ca8a04,color:#111827;
