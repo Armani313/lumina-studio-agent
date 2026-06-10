@@ -28,7 +28,21 @@ from lumina.config import settings
 from lumina.tools.delivery import mime_for_uri
 
 _URL_RE = re.compile(r"https?://[^\s)>\]}\"'»]+", re.I)
+# Customers usually paste links WITHOUT a scheme ("instagram.com/myshop", "www.brand.de"). Accepted
+# only with a www. prefix, a path, or a common TLD, so filenames/version strings don't become links.
+_BARE_URL_RE = re.compile(
+    r"(?<![\w@.\-/])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s)>\]}\"'»]*)?",
+    re.I,
+)
+_COMMON_TLDS = {
+    "com", "net", "org", "io", "co", "ai", "app", "dev", "me", "shop", "store", "site", "online",
+    "biz", "info", "xyz", "ru", "kz", "ua", "by", "uk", "de", "fr", "es", "it", "nl", "pl", "tr",
+    "us", "ca", "br", "mx", "in", "cn", "jp", "kr", "au",
+}
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif")
+# Login-walled platforms: their pages can't be fetched by url_context (or anything unauthenticated),
+# so we go straight to Google Search and, failing that, ask the customer for screenshots.
+_WALLED_HOSTS = ("instagram.com", "facebook.com", "fb.com", "tiktok.com", "x.com", "twitter.com", "threads.net")
 
 # Studied content is cached by source URL/URI so a multi-turn chat (especially the stateless
 # external webhook, which replays full history every turn) never re-analyses the same photo/link.
@@ -36,14 +50,29 @@ _STUDY_CACHE: dict[str, dict] = {}
 
 
 def find_links(text: str) -> list[str]:
-    """All http(s) URLs in a string, de-duplicated, order-preserving."""
+    """All http(s) URLs in a string — scheme-less ones ("instagram.com/myshop") normalized to
+    https:// — de-duplicated, order-preserving."""
     out, seen = [], set()
-    for m in _URL_RE.findall(text or ""):
-        u = m.rstrip(".,;")
-        if u not in seen:
+
+    def _add(u: str) -> None:
+        u = u.rstrip(".,;")
+        if u and u not in seen:
             seen.add(u)
             out.append(u)
+
+    t = text or ""
+    for m in _URL_RE.findall(t):
+        _add(m)
+    for m in _BARE_URL_RE.findall(_URL_RE.sub(" ", t)):  # sub: don't re-match inside found URLs
+        host = m.split("/", 1)[0].lower()
+        if host.startswith("www.") or "/" in m or host.rsplit(".", 1)[-1] in _COMMON_TLDS:
+            _add("https://" + m)
     return out
+
+
+def _is_walled(url: str) -> bool:
+    host = re.sub(r"^https?://(?:www\.)?", "", url, flags=re.I).split("/", 1)[0].lower()
+    return any(host == w or host.endswith("." + w) for w in _WALLED_HOSTS)
 
 
 def _looks_like_image(url: str, content_type: str = "") -> bool:
@@ -148,10 +177,61 @@ _PAGE_STUDY_PROMPT = (
 )
 
 
+_SEARCH_STUDY_PROMPT = (
+    "The page at this URL cannot be opened directly: {url}\n"
+    "Use Google Search to find out what this site/shop/account is about. Report ONLY what search "
+    "actually returns about THIS exact brand/page — do not guess or invent.\n"
+    "Return STRICT JSON (no prose, no code fences):\n"
+    '  "found": true ONLY if search returned reliable info about this exact page/brand,\n'
+    '  "summary": 1-2 sentences on what it is and its positioning (empty if not found),\n'
+    '  "palette": dominant brand colors if known,\n'
+    '  "tone": 3-6 brand voice / mood words,\n'
+    '  "style": short phrase on the visual style.'
+)
+
+
+def study_page_via_search(url: str) -> dict:
+    """Fallback when a page can't be fetched (login wall / bot-blocked): learn about it from Google Search."""
+    try:
+        resp = gemini_client().models.generate_content(
+            model=settings.model_reasoning,
+            contents=_SEARCH_STUDY_PROMPT.format(url=url),
+            # google_search grounding can't be combined with response_mime_type=json — parse leniently.
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                max_output_tokens=4096,
+            ),
+        )
+        data = _parse_json(resp.text)
+        if not data or data.get("found") is not True:
+            return {"ok": False, "url": url, "media": "page"}
+        return {
+            "ok": True,
+            "url": url,
+            "media": "page",
+            "via": "search",
+            "summary": str(data.get("summary") or "").strip(),
+            "palette": data.get("palette") or "",
+            "tone": data.get("tone") or "",
+            "style": str(data.get("style") or "").strip(),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "url": url, "media": "page", "error": str(e)[:160]}
+
+
 def study_page(url: str) -> dict:
-    """Read a web page with Gemini's url_context tool and extract brand cues. Cached by URL."""
+    """Read a web page with Gemini's url_context tool and extract brand cues. Cached by URL.
+
+    Login-walled platforms (Instagram & co) skip url_context — it always fails there — and go
+    straight to the Google-Search fallback; the ``walled`` flag lets the dialogue ask for
+    screenshots instead when even search comes up empty.
+    """
     if url in _STUDY_CACHE:
         return _STUDY_CACHE[url]
+    if _is_walled(url):
+        res = {**study_page_via_search(url), "walled": True}
+        _STUDY_CACHE[url] = res
+        return res
     try:
         resp = gemini_client().models.generate_content(
             model=settings.model_reasoning,
@@ -175,6 +255,10 @@ def study_page(url: str) -> dict:
         }
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "url": url, "media": "page", "error": str(e)[:160]}
+    if not res["ok"]:  # fetch refused/failed (bot-blocked site etc.) — try learning via Search
+        fb = study_page_via_search(url)
+        if fb.get("ok"):
+            res = fb
     _STUDY_CACHE[url] = res
     return res
 
@@ -183,6 +267,8 @@ def study_link(url: str) -> dict:
     """Study one shared link: an image URL -> vision; otherwise a web page -> url_context."""
     if _looks_like_image(url):
         return study_image(url)
+    if _is_walled(url):  # don't probe login-walled hosts — study_page routes them via Search
+        return study_page(url)
     # Quick content-type probe so a bare image URL (no extension) is still vision-analysed.
     try:
         head = httpx.head(url, timeout=8, follow_redirects=True)
@@ -265,7 +351,8 @@ def study_all(photo_url: str | None, message: str, history: list[dict], deadline
         )
     for r in references:
         host = re.sub(r"^https?://(www\.)?", "", r["url"]).split("/", 1)[0]
-        chip_bits.append(("🌐 read " if r.get("media") == "page" else "🖼️ studied ") + host)
+        icon = "🔎 researched " if r.get("via") == "search" else ("🌐 read " if r.get("media") == "page" else "🖼️ studied ")
+        chip_bits.append(icon + host)
         fact_lines.append(
             f"SHARED {'LINK' if r.get('media') == 'page' else 'REFERENCE'} ({r['url']}): "
             + "; ".join(
@@ -281,7 +368,14 @@ def study_all(photo_url: str | None, message: str, history: list[dict], deadline
     for role, url in jobs:
         r = results.get(url)
         if role == "link" and (not r or not r.get("ok")):
-            fact_lines.append(f"SHARED LINK ({url}): could NOT be read — ask the customer to describe it or share another.")
+            if r and r.get("walled"):
+                fact_lines.append(
+                    f"SHARED LINK ({url}): this platform is login-walled — you CANNOT open it, and web "
+                    "search found nothing about this account. Say so honestly and ask for a SCREENSHOT "
+                    "of the profile/page or 2-3 product photos instead (you can study images)."
+                )
+            else:
+                fact_lines.append(f"SHARED LINK ({url}): could NOT be read — ask the customer to describe it or share another.")
 
     return {
         "product": product,
