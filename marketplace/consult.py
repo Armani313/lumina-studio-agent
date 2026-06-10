@@ -443,7 +443,8 @@ _SYSTEM = (
     "Instagram) so you can match their exact style. Ask for these naturally, not all at once.\n"
     "- Gather target PLATFORM(s) (Instagram/TikTok/Amazon/web…) and rough VOLUME (images, videos, "
     "cards) and any mood/must-haves. Infer sensible defaults from the platform; don't over-ask "
-    "(≤ ~3 short questions total, ideally 1–2).\n"
+    "(≤ ~3 short questions total, ideally 1–2). If the customer doesn't specify volume, propose the "
+    "BASE PACKAGE: 16 varied images + 2 videos + 2 cards.\n"
     "- PRICING: base $7 + $1/image + $2/video + $1/card. Use this exact formula when proposing.\n"
     "- DISCUSS FIRST. Set propose=true ONLY once you actually KNOW the product (the customer shared "
     "a photo or clearly described it) AND have a rough scope (at least a platform + how much "
@@ -557,3 +558,60 @@ def run_consult(
         if p and p.get("media") == "image" and str(p.get("url") or "").startswith(("http://", "https://", "gs://")):
             spec["product_image_url"] = p["url"]
     return {"text": text, "propose": propose and spec is not None, "spec": spec, "etaMinutes": eta, "studied": studied}
+
+
+def classify_revision(revision_text: str, spec: dict | None, prior_assets: list[dict]) -> dict | None:
+    """Scope a buyer's revision: which delivered asset kinds actually need regeneration.
+
+    A revision like "make the cards in English" must redo ONLY the cards — not re-shoot every
+    image and video the buyer already approved. Returns
+    {"regenerate": {"images","videos","cards": bool}, "language", "image_count", "card_count",
+    "video_kinds", "summary"} — or None when the model gives nothing usable (the caller then
+    falls back to a full re-run, the safe default).
+    """
+    have: dict[str, int] = {}
+    for a in prior_assets or []:
+        k = str(a.get("type") or "?")
+        have[k] = have.get(k, 0) + 1
+    prompt = (
+        "You scope a REVISION request for an already-delivered product-content package on a "
+        "freelance marketplace. Decide the MINIMAL set of asset kinds that must be regenerated to "
+        "satisfy the buyer; every other kind is kept untouched from the previous delivery.\n\n"
+        f"Buyer's revision message:\n{revision_text}\n\n"
+        f"Original production spec of the paid order:\n{json.dumps(spec or {}, ensure_ascii=False)}\n\n"
+        f"Previously delivered assets (kind: count): {json.dumps(have, ensure_ascii=False)}\n\n"
+        "Rules:\n"
+        "• Mark a kind true ONLY if satisfying the message requires changing that kind: 'product "
+        "cards in English' -> cards only; 'the photos feel dark' -> images only; 'redo everything "
+        "in a luxury style' -> every kind the order contains.\n"
+        "• Marketing copy/text is always refreshed automatically — never regenerate images merely "
+        "because wording changes.\n"
+        "• If the message is ONLY a question / pure information with NO content change implied, set "
+        "all kinds false and answer the question directly in 'summary'.\n"
+        "• 'language': a short code ('en', 'ru', …) ONLY when the buyer asks for a language change, "
+        "else \"\".\n"
+        "• 'image_count'/'card_count'/'video_kinds': fill ONLY when the buyer explicitly asks for a "
+        "different quantity or video type, else null.\n"
+        "• 'summary': ONE short sentence in the buyer's language saying what you will do.\n\n"
+        'Reply with EXACTLY this JSON object: {"regenerate": {"images": <bool>, "videos": <bool>, '
+        '"cards": <bool>}, "language": "<code or empty>", "image_count": <int or null>, '
+        '"card_count": <int or null>, "video_kinds": <["360"|"voiceover"|"ugc"|"macro", ...] or null>, '
+        '"summary": "<one line>"}'
+    )
+    try:
+        resp = gemini_client().models.generate_content(
+            model=settings.model_reasoning,
+            contents=prompt,
+            # Thinking model: generous output budget so the JSON never starves mid-thought
+            # (same failure class as run_consult's empty-reply fallback).
+            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=8192),
+        )
+        data = _parse_json(resp.text)
+    except Exception as e:  # noqa: BLE001
+        print(f"[revision] classifier error: {e!r}", flush=True)
+        return None
+    regen = data.get("regenerate")
+    if not isinstance(regen, dict):
+        return None
+    data["regenerate"] = {k: bool(regen.get(k)) for k in ("images", "videos", "cards")}
+    return data

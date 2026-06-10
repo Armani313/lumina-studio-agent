@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import io
 import json
 import os
 import threading
@@ -104,15 +105,42 @@ def _proxy_url(gs_uri: str) -> str:
     return f"{SERVICE_URL}/api/asset?uri=" + urllib.parse.quote(gs_uri, safe="")
 
 
+_VEO_SAFE_CTS = ("image/png", "image/jpeg")
+
+
+def _normalize_product_image(data: bytes, content_type: str) -> tuple[bytes, str, str]:
+    """(bytes, ext, content_type) for storing a buyer's product photo, re-encoded to PNG when needed.
+
+    Marketplace uploads arrive as webp (Firebase re-encodes them), but Veo image-to-video accepts
+    only png/jpeg — a webp source made EVERY ordered video fail with 'Unsupported image format'.
+    Anything Pillow can decode that isn't already png/jpeg is converted; undecodable data is stored
+    as-is (vision/Imagen still cope with it)."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in _VEO_SAFE_CTS:
+        return data, ("png" if ct == "image/png" else "jpg"), ct
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        return buf.getvalue(), "png", "image/png"
+    except Exception:
+        ext = "webp" if "webp" in ct else ("png" if "png" in ct else "jpg")
+        return data, ext, (ct or "image/png")
+
+
 def _fetch_image_to_gcs(url: str) -> str | None:
     """Download a buyer-provided product image URL into our bucket; return its gs:// URI."""
     try:
         # Browser-like headers: CDNs/shops with bot protection 403 the default httpx user agent.
         r = httpx.get(url, timeout=45, follow_redirects=True, headers=consult_engine.BROWSER_HEADERS)
         r.raise_for_status()
-        ct = (r.headers.get("content-type") or "").lower()
-        ext = "png" if "png" in ct else ("webp" if "webp" in ct else "jpg")
-        return upload_bytes(r.content, f"inputs/mkt_{uuid.uuid4().hex}.{ext}", ct or "image/png")
+        data, ext, ct = _normalize_product_image(r.content, r.headers.get("content-type") or "")
+        return upload_bytes(data, f"inputs/mkt_{uuid.uuid4().hex}.{ext}", ct)
     except Exception:
         return None
 
@@ -217,13 +245,23 @@ def _dispatch(coro) -> None:
     fut.add_done_callback(_log_unhandled)
 
 
+_KIND_TO_STATE = {"image": "images", "card": "cards", "video": "videos"}
+
+
 async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_link: str,
                                cb_url: str, cb_token: str, delivery_id: str = "",
-                               jid: str = "") -> None:
-    """Background: run the full agent for an external-marketplace task, then POST the result.
+                               jid: str = "", revision_text: str = "", prior_jid: str = "") -> None:
+    """Background: run the agent for an external-marketplace task, then POST the result.
 
     Always finishes with exactly one callback: {status: "completed", outputs} once real assets
     exist, otherwise {status: "failed", error}. Never reports a hollow completion.
+
+    A REVISION (revision_text + prior_jid) is first scoped by an LLM classifier: only the asset
+    kinds the buyer actually wants changed are regenerated (via a narrowed spec — the pipeline
+    agents honor 0 images / [] videos / 0 cards), and everything else is carried over from the
+    previously delivered package. A pure question (nothing to regenerate) re-delivers the prior
+    package with the answer in the markdown — no generation at all. If scoping fails, we fall
+    back to the previous behavior: a full re-run of the whole order.
 
     The run is also narrated into escrow job `jid` (same feed as the local UI), which powers the
     public buyer-facing live page /live/{jid} — escrow writes are best-effort and must never
@@ -326,6 +364,19 @@ def _quote_cents(spec: dict, min_cents: int = 0) -> int:
     return max(cents, min_cents, 50)
 
 
+def _spec_count(d: dict, keys: tuple[str, ...], default: int) -> int:
+    """First numeric value among keys — honoring an EXPLICIT 0 ('no images, just the video')."""
+    for k in keys:
+        v = d.get(k)
+        if v is None or isinstance(v, bool) or v == "":
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
 def _spec_from_inputs(inputs: dict) -> dict | None:
     """Map an accepted proposal's spec (which arrives as task.inputs) into a ProductionSpec dict."""
     if not any(k in inputs for k in ("images", "image_count", "videos", "cards", "card_count", "platforms", "video_kinds")):
@@ -340,15 +391,79 @@ def _spec_from_inputs(inputs: dict) -> dict | None:
     videos = [{"kind": k, "aspect_ratio": "9:16", "duration_seconds": 8} for k in kinds if k]
     return {
         "platforms": inputs.get("platforms") or [],
-        "image_count": max(1, min(int(inputs.get("images") or inputs.get("image_count") or 6), 20)),
+        "image_count": max(0, min(_spec_count(inputs, ("images", "image_count"), 16), 20)),
         "image_aspect_ratios": inputs.get("image_aspect_ratios") or ["4:5", "1:1"],
         "videos": videos,
-        "card_count": max(0, min(int(inputs.get("cards") or inputs.get("card_count") or 0), 5)),
+        "card_count": max(0, min(_spec_count(inputs, ("cards", "card_count"), 0), 5)),
         "card_aspect_ratio": "4:5",
         "copy_channels": inputs.get("platforms") or ["instagram"],
         "language": inputs.get("language") or "",
         "mood": inputs.get("mood") or "",
     }
+
+
+def _scoped_spec(base: dict | None, scope: dict) -> dict:
+    """Narrow a production spec to ONLY what a revision regenerates.
+
+    Kinds the buyer didn't ask to change get zeroed out (0 images / [] videos / 0 cards) — the
+    pipeline agents honor that and skip the work — while the buyer's explicit overrides
+    (language, counts, video kinds) are applied to the kinds being redone.
+    """
+    s = dict(base or default_spec())
+    regen = scope.get("regenerate") or {}
+    if regen.get("images"):
+        if scope.get("image_count"):
+            s["image_count"] = max(1, min(int(scope["image_count"]), 20))
+    else:
+        s["image_count"] = 0
+    if regen.get("videos"):
+        if scope.get("video_kinds"):
+            s["videos"] = [{"kind": str(k), "aspect_ratio": "9:16", "duration_seconds": 8}
+                           for k in scope["video_kinds"] if k]
+        if not s.get("videos"):  # asked to change videos but the order/scope named none -> one 360
+            s["videos"] = [{"kind": "360", "aspect_ratio": "9:16", "duration_seconds": 8}]
+    else:
+        s["videos"] = []
+    if regen.get("cards"):
+        if scope.get("card_count"):
+            s["card_count"] = max(1, min(int(scope["card_count"]), 5))
+        elif not int(s.get("card_count") or 0):  # cards requested on an order that had none
+            s["card_count"] = 2
+    else:
+        s["card_count"] = 0
+    if scope.get("language"):
+        s["language"] = str(scope["language"])
+    return s
+
+
+def _shortfall_note(spec: dict | None, outputs: dict) -> str | None:
+    """Honest delivery note when the package holds fewer assets than the paid spec ordered.
+
+    Previously a run whose video generation failed still reported a plain 'completed' — the buyer
+    paid for a video and silently never got one. The package is still delivered (partial value
+    beats none), but the shortfall is now stated in the buyer-facing markdown."""
+    if not spec:
+        return None
+    want = {
+        "images": int(spec.get("image_count") or 0),
+        "videos": len(spec.get("videos") or []),
+        "cards": int(spec.get("card_count") or 0),
+    }
+    lang = str(spec.get("language") or "").lower()
+    ru = lang.startswith("ru") or "рус" in lang
+    labels = ({"images": "изображений", "videos": "видео", "cards": "карточек товара"} if ru
+              else {"images": "image(s)", "videos": "video(s)", "cards": "product card(s)"})
+    missing = [f"{want[k] - len(outputs.get(k) or [])} {labels[k]}"
+               for k in ("images", "videos", "cards") if want[k] > len(outputs.get(k) or [])]
+    if not missing:
+        return None
+    if ru:
+        return ("⚠️ Честное примечание: в этот пакет не вошло " + ", ".join(missing)
+                + " — не удалось надёжно сгенерировать в этом прогоне. Запросите ревизию — "
+                  "переделаем именно их, бесплатно.")
+    return ("⚠️ Honest note: this package is missing " + ", ".join(missing)
+            + " — they could not be reliably generated in this run. Request a revision and we "
+              "will redo exactly those, free of charge.")
 
 
 def _consult_reply(consult: dict) -> dict:
@@ -496,9 +611,10 @@ async def create_job(
     data = await product_photo.read()
     if not data:
         raise HTTPException(400, "empty product photo")
-    uri = upload_bytes(
-        data, f"inputs/{uuid.uuid4().hex}.png", mime_for_uri(product_photo.filename or ".png")
+    data, ext, ct = _normalize_product_image(
+        data, product_photo.content_type or mime_for_uri(product_photo.filename or ".png")
     )
+    uri = upload_bytes(data, f"inputs/{uuid.uuid4().hex}.{ext}", ct)
     brief = description if not brand_link else f"{description}\nBrand link: {brand_link}"
     jid = escrow.create_job(brief, uri, brand_link, price=price_for_spec(default_spec()))
     # Run the agent on the shared background loop so its blocking tool calls (image/video gen)

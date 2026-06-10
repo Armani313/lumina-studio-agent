@@ -31,7 +31,7 @@ consultant_agent = LlmAgent(
         "Pricing (so you can guide budget): base $7 + $1/image + $2/video + $1/card.\n"
         "Be efficient and decisive: once the customer confirms, OR if they give no preferences / say "
         "'just do it' after you have proposed a concrete plan, CALL finalize_plan with the agreed "
-        "values. Sensible defaults if unspecified: 6 images (4:5 & 1:1), a '360' + a 'voiceover', 2 "
+        "values. Sensible defaults if unspecified: 16 images (4:5 & 1:1), a '360' + a 'voiceover', 2 "
         "cards (4:5), copy for the main platform. Do NOT call finalize_plan until you have proposed a "
         "concrete plan to the customer at least once.\n"
         "AFTER finalize_plan: reply with a short, friendly recap of the plan and the total price from "

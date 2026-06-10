@@ -54,7 +54,7 @@ def finalize_plan(
     videos = [VideoClip(kind=k, aspect_ratio=var, duration_seconds=8) for k in kinds[:4]]
     spec = ProductionSpec(
         platforms=[str(p).strip().lower() for p in (platforms or [])],
-        image_count=max(1, min(int(image_count or 6), 20)),
+        image_count=max(1, min(int(image_count or 16), 20)),
         image_aspect_ratios=ratios,
         videos=videos,
         card_count=max(0, min(int(card_count or 0), 5)),

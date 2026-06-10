@@ -27,8 +27,8 @@ class Settings:
     model_image_pro: str = os.getenv("MODEL_IMAGE_PRO", "gemini-3-pro-image")
     model_video: str = os.getenv("MODEL_VIDEO", "veo-3.1-fast-generate-001")
 
-    # Number of lifestyle shots to plan/generate per order. DEV ~5; FULL 12-20 for final render.
-    image_count: int = int(os.getenv("IMAGE_COUNT", "6"))
+    # Number of lifestyle shots to plan/generate per order (base package).
+    image_count: int = int(os.getenv("IMAGE_COUNT", "16"))
 
     vertex_search_datastore: str = os.getenv(
         "VERTEX_SEARCH_DATASTORE",

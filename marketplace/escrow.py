@@ -92,6 +92,23 @@ def job_id_for_delivery(delivery_id: str) -> str | None:
     return (snap.to_dict() or {}).get("job_id") if snap.exists else None
 
 
+TASK_MAP = "marketplace_task_map"
+
+
+def map_task(task_id: str, jid: str) -> None:
+    """Remember the newest job serving a marketplace TASK id.
+
+    A revision arrives with a NEW deliveryId but the SAME task.id, so this map — not the
+    delivery map — is how task.revision_requested finds the package it must amend.
+    """
+    db().collection(TASK_MAP).document(_safe_doc_id(task_id)).set({"job_id": jid, "at": _now()})
+
+
+def job_id_for_task(task_id: str) -> str | None:
+    snap = db().collection(TASK_MAP).document(_safe_doc_id(task_id)).get()
+    return (snap.to_dict() or {}).get("job_id") if snap.exists else None
+
+
 def log_inbound(payload: dict) -> str:
     """Persist a raw inbound marketplace payload so we can map its contract."""
     rid = uuid.uuid4().hex[:12]

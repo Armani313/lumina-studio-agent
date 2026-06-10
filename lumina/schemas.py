@@ -43,7 +43,7 @@ class ProductionSpec(BaseModel):
     platforms: list[str] = Field(
         default_factory=list, description="Target platforms, e.g. ['instagram','amazon','tiktok']."
     )
-    image_count: int = Field(default=6, description="How many images to produce.")
+    image_count: int = Field(default=16, description="How many images to produce.")
     image_aspect_ratios: list[str] = Field(
         default_factory=lambda: ["4:5", "1:1"], description="Allowed image aspect ratios."
     )

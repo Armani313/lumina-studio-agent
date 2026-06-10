@@ -76,7 +76,7 @@ def default_spec() -> dict:
     """A sensible default plan when the user gives no preferences (keeps the 'just do it' path)."""
     return {
         "platforms": ["instagram"],
-        "image_count": 6,
+        "image_count": 16,
         "image_aspect_ratios": ["4:5", "1:1"],
         "videos": [
             {"kind": "360", "aspect_ratio": "16:9", "duration_seconds": 8},
