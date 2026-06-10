@@ -296,8 +296,58 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
         _cb({"status": "failed", "error": err})
 
     print(f"{tag} start image_url={(image_url or '')[:90]!r} brief={(brief or '')[:80]!r}"
-          f" live={live_url or '-'}", flush=True)
+          f" revision={'yes' if revision_text else 'no'} live={live_url or '-'}", flush=True)
     try:
+        order_spec = _spec_from_inputs(inputs)
+        spec = order_spec
+
+        # ---- Revision scoping: redo ONLY what the buyer asked to change -------------------
+        scope: dict | None = None
+        reused: list[dict] = []
+        prior_pkg: dict = {}
+        if revision_text and prior_jid:
+            try:
+                prior_pkg = (escrow.get_job(prior_jid) or {}).get("package") or {}
+            except Exception:  # noqa: BLE001
+                prior_pkg = {}
+            if prior_pkg.get("assets"):
+                scope = await asyncio.to_thread(
+                    consult_engine.classify_revision, revision_text, order_spec,
+                    prior_pkg.get("assets") or [])
+            if scope:
+                regen = scope["regenerate"]
+                reused = [a for a in (prior_pkg.get("assets") or [])
+                          if a.get("uri") and not regen.get(_KIND_TO_STATE.get(str(a.get("type")), ""))]
+                spec = _scoped_spec(order_spec, scope)
+                redo = [k for k, v in regen.items() if v]
+                print(f"{tag} revision scoped: redo={redo or ['nothing']} reuse={len(reused)} "
+                      f"lang={scope.get('language') or '-'}", flush=True)
+                _note(("📝 Revision scoped: regenerating only " + ", ".join(redo)
+                       + f" — keeping {len(reused)} previously approved asset(s)") if redo else
+                      "📝 Revision is a question — answering and re-delivering the approved package",
+                      "stage")
+
+                if not any(regen.values()):
+                    # Pure question: answer it, re-deliver the prior package, generate nothing.
+                    st = {sk: "\n".join(a["uri"] for a in (prior_pkg.get("assets") or [])
+                                        if a.get("type") == kind and a.get("uri"))
+                          for kind, sk in _KIND_TO_STATE.items()}
+                    st["copy_full"] = prior_pkg.get("copy") or {}
+                    outputs = _build_outputs(st, live_url=live_url)
+                    answer = str(scope.get("summary") or "").strip()
+                    if answer:
+                        outputs["markdown"] = f"{answer}\n\n{outputs['markdown']}"
+                    if jid:
+                        try:
+                            escrow.update_job(jid, status="Delivered", package=dict(prior_pkg))
+                            escrow.add_event(jid, "Answered the buyer; re-delivered the approved package unchanged")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    _cb({"status": "completed", "outputs": outputs})
+                    return
+            else:
+                _note("📝 Could not scope the revision — re-running the full order to be safe", "system")
+
         if not image_url:
             _fail("no product image in task inputs or attachments")
             return
@@ -307,7 +357,6 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
             return
         full_brief = brief if not brand_link else f"{brief}\nBrand link: {brand_link}"
         seed = {"product_image_uri": product_uri, "brief_text": full_brief, "brand_link": brand_link}
-        spec = _spec_from_inputs(inputs)
         if spec:
             seed["spec"] = spec
         print(f"{tag} fetched product->gcs; running agent (spec={'yes' if spec else 'no'})", flush=True)
@@ -326,9 +375,24 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
                 _note(line, kind)
         st = dict((await runner.session_service.get_session(
             app_name="lumina_ext", user_id=uid, session_id=session.id)).state)
+        # Fold the kept assets from the previous delivery back into the package (scoped revision).
+        for a in reused:
+            key = _KIND_TO_STATE.get(str(a.get("type")), "")
+            if key:
+                st[key] = f"{st.get(key) or ''}\n{a['uri']}".strip()
         outputs = _build_outputs(st, live_url=live_url)
+        if scope and str(scope.get("summary") or "").strip():
+            outputs["markdown"] = f"_{str(scope['summary']).strip()}_\n\n{outputs['markdown']}"
+        # Honesty over silence: if the paid order wanted more than this package contains
+        # (e.g. the video could not be generated), say so in the buyer-facing markdown.
+        shortfall = _shortfall_note(order_spec, outputs)
+        if shortfall:
+            outputs["markdown"] = f"{outputs['markdown']}\n\n{shortfall}"
+            _note(shortfall, "system")
+            print(f"{tag} delivered with shortfall: {shortfall[:140]!r}", flush=True)
         print(f"{tag} agent done; assets images={len(outputs.get('images') or [])} "
-              f"cards={len(outputs.get('cards') or [])} videos={len(outputs.get('videos') or [])}", flush=True)
+              f"cards={len(outputs.get('cards') or [])} videos={len(outputs.get('videos') or [])} "
+              f"(reused {len(reused)})", flush=True)
         # Guard: never report a hollow "completed" with no media (the original failure class).
         if not (outputs.get("images") or outputs.get("videos") or outputs.get("cards")):
             _fail("generation produced no deliverable assets")
@@ -515,6 +579,10 @@ async def marketplace_webhook(
             -> respond {status: "accepted", liveUrl} now; the finished package is POSTed to
                callback.url (Bearer callback.bearerToken) within the offer's ETA. liveUrl is
                a public read-only page streaming the agent's work (see docs/LIVE_VIEW_INTEGRATION.md).
+               A revision is SCOPED, not re-run: an LLM classifier reads revisionInstructions and
+               only the asset kinds the buyer wants changed are regenerated; the rest of the
+               previously delivered package (found via task.id) is carried over. A pure question
+               re-delivers the prior package with the answer in the markdown.
 
     A real order is NEVER answered with the "connected" stub, and a synchronous
     {status: "completed"} is only ever returned for the test handshake.
@@ -564,10 +632,20 @@ async def marketplace_webhook(
             image_url = candidate
     brief = _first(inputs, ["brief", "description", "prompt", "topic", "task", "instructions", "details"])
     brand_link = _first(inputs, ["brand_link", "brand_url", "website", "url"])
-    # On a revision request, fold the buyer's feedback into the brief so the re-run addresses it.
+    task_id = str(task.get("id") or "")
+    # On a revision request, fold the buyer's feedback into the brief (so whatever IS regenerated
+    # addresses it) and locate the previously delivered job — a revision arrives with a NEW
+    # deliveryId but the SAME task.id, so the task map is the reliable route to the prior package.
+    # _run_marketplace_job then scopes the revision to only the asset kinds the buyer wants changed.
     revision = _first(task, ["revisionInstructions", "revision_instructions", "feedback"])
+    prior_jid = ""
     if revision:
         brief = f"{brief}\n\nRevision requested by buyer: {revision}".strip()
+        try:
+            prior_jid = ((task_id and escrow.job_id_for_task(task_id))
+                         or (delivery_id and escrow.job_id_for_delivery(str(delivery_id))) or "")
+        except Exception:  # noqa: BLE001 — lookup is best-effort; worst case we re-run in full
+            prior_jid = ""
 
     # Anything with no order signal (no task/inputs/attachments) is acknowledged, never faked.
     if not (image_url or inputs or task.get("attachments")):
@@ -578,18 +656,25 @@ async def marketplace_webhook(
     # the moment the marketplace renders our response: /live/{jid} (or the template-able
     # /live/d/{deliveryId}) streams the agent's thinking feed while the order is produced.
     spec = _spec_from_inputs(inputs)
+    extra = {"delivery_id": str(delivery_id or ""), "source": "external"}
+    if task_id:
+        extra["task_id"] = task_id
+    if prior_jid:
+        extra["revision_of"] = prior_jid
     jid = escrow.create_job(
         brief or "Marketplace order",
         image_url,
         brand_link,
         price=(_quote_cents(spec) // 100) if spec else 0,
-        extra={"delivery_id": str(delivery_id or ""), "source": "external"},
+        extra=extra,
     )
     if delivery_id:
         escrow.map_delivery(str(delivery_id), jid)
+    if task_id:
+        escrow.map_task(task_id, jid)
     live_url = f"{SERVICE_URL}/live/{jid}"
     _dispatch(_run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token,
-                                   delivery_id, jid=jid))
+                                   delivery_id, jid=jid, revision_text=revision, prior_jid=prior_jid))
     return {"status": "accepted", "liveUrl": live_url,
             "note": f"Watch the agent think & work live: {live_url}"}
 

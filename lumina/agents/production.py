@@ -13,7 +13,9 @@ image_production_agent = LlmAgent(
         "You produce product images. For EACH shot in the plan below, call generate_lifestyle_image "
         "with that shot's scene_description, aspect_ratio and shot_type (pass shot_type exactly — "
         "'hero'/'ecommerce' shots are rendered at higher quality). After all shots are generated, "
-        "reply with a JSON array where each element has the fields channel, gs_uri and https_url.\n\n"
+        "reply with a JSON array where each element has the fields channel, gs_uri and https_url. "
+        "If the plan contains NO shots (a scoped revision that regenerates other asset kinds only), "
+        "call no tools and reply with an empty JSON array [].\n\n"
         "Shot plan:\n{plan}"
     ),
     tools=[generate_lifestyle_image],

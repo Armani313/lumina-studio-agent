@@ -15,7 +15,10 @@ brand_qa_agent = LlmAgent(
         "gs_uri>, scene_description=<an improved scene that applies the fix_suggestion and keeps the "
         "product the faithful hero>, aspect_ratio=<the shot's ratio>) — this regenerates AND swaps "
         "the corrected image into the delivered set — then review the returned new_uri. Only once "
-        "EVERY image passes, call exit_loop to approve and stop. Finally summarize the QA outcome.\n\n"
+        "EVERY image passes, call exit_loop to approve and stop. Finally summarize the QA outcome. "
+        "If there are NO images at all (an empty list — e.g. a scoped revision that regenerates "
+        "other asset kinds only), call exit_loop immediately and reply that there was nothing to "
+        "review.\n\n"
         "Brief:\n{brief}\n\nImages:\n{images}"
     ),
     tools=[review_image_brand_fit, replace_failed_image, exit_loop],
