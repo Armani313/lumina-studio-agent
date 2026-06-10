@@ -25,6 +25,7 @@ from google.genai import types
 
 from lumina.clients import gemini_client
 from lumina.config import settings
+from lumina.pricing import FREE_REVISIONS
 from lumina.tools.delivery import mime_for_uri
 
 _URL_RE = re.compile(r"https?://[^\s)>\]}\"'»]+", re.I)
@@ -446,6 +447,10 @@ _SYSTEM = (
     "(≤ ~3 short questions total, ideally 1–2). If the customer doesn't specify volume, propose the "
     "BASE PACKAGE: 16 varied images + 2 videos + 2 cards.\n"
     "- PRICING: base $7 + $1/image + $2/video + $1/card. Use this exact formula when proposing.\n"
+    f"- REVISION POLICY: every order includes up to {FREE_REVISIONS} free revisions; each revision "
+    "redoes ONLY what the customer asks to change and never more than the paid scope (no free "
+    "top-ups); questions are always free. Mention this briefly when proposing a plan, and refer "
+    "to it if the customer expects unlimited re-rolls.\n"
     "- DISCUSS FIRST. Set propose=true ONLY once you actually KNOW the product (the customer shared "
     "a photo or clearly described it) AND have a rough scope (at least a platform + how much "
     "content). If they are just greeting, asking what you do, or haven't shared their product yet, "
@@ -592,6 +597,9 @@ def classify_revision(revision_text: str, spec: dict | None, prior_assets: list[
         "else \"\".\n"
         "• 'image_count'/'card_count'/'video_kinds': fill ONLY when the buyer explicitly asks for a "
         "different quantity or video type, else null.\n"
+        "• The PAID scope is a hard cap: a revision can never produce MORE items of a kind than the "
+        "original order paid for, nor a kind the order didn't include — never promise that in "
+        "'summary' (suggest a separate order instead).\n"
         "• 'summary': ONE short sentence in the buyer's language saying what you will do.\n\n"
         'Reply with EXACTLY this JSON object: {"regenerate": {"images": <bool>, "videos": <bool>, '
         '"cards": <bool>}, "language": "<code or empty>", "image_count": <int or null>, '

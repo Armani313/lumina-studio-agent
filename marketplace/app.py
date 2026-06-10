@@ -28,7 +28,8 @@ from google.adk.runners import InMemoryRunner
 from lumina.agent import root_agent
 from lumina.clients import gemini_client
 from lumina.config import settings
-from lumina.pricing import BASE_PRICE, PER_CARD, PER_IMAGE, PER_VIDEO, default_spec, price_for_spec
+from lumina.pricing import (BASE_PRICE, FREE_REVISIONS, PER_CARD, PER_IMAGE, PER_VIDEO,
+                            default_spec, price_for_spec)
 from lumina.tools.delivery import mime_for_uri, upload_bytes
 
 from . import consult as consult_engine
@@ -250,7 +251,8 @@ _KIND_TO_STATE = {"image": "images", "card": "cards", "video": "videos"}
 
 async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_link: str,
                                cb_url: str, cb_token: str, delivery_id: str = "",
-                               jid: str = "", revision_text: str = "", prior_jid: str = "") -> None:
+                               jid: str = "", revision_text: str = "", prior_jid: str = "",
+                               task_id: str = "", revisions_used: int = 0) -> None:
     """Background: run the agent for an external-marketplace task, then POST the result.
 
     Always finishes with exactly one callback: {status: "completed", outputs} once real assets
@@ -262,6 +264,13 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
     previously delivered package. A pure question (nothing to regenerate) re-delivers the prior
     package with the answer in the markdown — no generation at all. If scoping fails, we fall
     back to the previous behavior: a full re-run of the whole order.
+
+    REGENERATION BUDGET: an order includes FREE_REVISIONS generation-consuming revisions, counted
+    in the task map (revisions_used arrives from the webhook; the counter is bumped only when a
+    revision actually delivers regenerated content). Past the limit the approved package is
+    re-delivered unchanged with a polite limit note; questions stay free and always answered. Each
+    consumed revision tells the buyer how many remain, and a revision can never produce MORE than
+    the paid scope (counts capped, unpaid kinds denied with a note).
 
     The run is also narrated into escrow job `jid` (same feed as the local UI), which powers the
     public buyer-facing live page /live/{jid} — escrow writes are best-effort and must never
@@ -305,47 +314,80 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
         scope: dict | None = None
         reused: list[dict] = []
         prior_pkg: dict = {}
+        denied: list[str] = []
+        consumes_revision = False
+        ru = _is_ru(order_spec, revision_text, brief)
         if revision_text and prior_jid:
             try:
                 prior_pkg = (escrow.get_job(prior_jid) or {}).get("package") or {}
             except Exception:  # noqa: BLE001
                 prior_pkg = {}
+
+            def _redeliver_prior(note_md: str, event_msg: str) -> None:
+                """Deliver the previously approved package unchanged (question / limit reached)."""
+                st = {sk: "\n".join(a["uri"] for a in (prior_pkg.get("assets") or [])
+                                    if a.get("type") == kind and a.get("uri"))
+                      for kind, sk in _KIND_TO_STATE.items()}
+                st["copy_full"] = prior_pkg.get("copy") or {}
+                outs = _build_outputs(st, live_url=live_url)
+                if note_md:
+                    outs["markdown"] = f"{note_md}\n\n{outs['markdown']}"
+                if jid:
+                    try:
+                        escrow.update_job(jid, status="Delivered", package=dict(prior_pkg))
+                        escrow.add_event(jid, event_msg)
+                    except Exception:  # noqa: BLE001
+                        pass
+                _cb({"status": "completed", "outputs": outs})
+
             if prior_pkg.get("assets"):
                 scope = await asyncio.to_thread(
                     consult_engine.classify_revision, revision_text, order_spec,
                     prior_pkg.get("assets") or [])
             if scope:
                 regen = scope["regenerate"]
+                denied = _denied_kinds(order_spec, regen)
                 reused = [a for a in (prior_pkg.get("assets") or [])
                           if a.get("uri") and not regen.get(_KIND_TO_STATE.get(str(a.get("type")), ""))]
                 spec = _scoped_spec(order_spec, scope)
-                redo = [k for k, v in regen.items() if v]
-                print(f"{tag} revision scoped: redo={redo or ['nothing']} reuse={len(reused)} "
+                redo = [k for k, v in regen.items() if v and k not in denied]
+                print(f"{tag} revision scoped: redo={redo or ['nothing']} denied={denied or '-'} "
+                      f"reuse={len(reused)} budget={revisions_used}/{FREE_REVISIONS} "
                       f"lang={scope.get('language') or '-'}", flush=True)
-                _note(("📝 Revision scoped: regenerating only " + ", ".join(redo)
-                       + f" — keeping {len(reused)} previously approved asset(s)") if redo else
-                      "📝 Revision is a question — answering and re-delivering the approved package",
-                      "stage")
 
-                if not any(regen.values()):
-                    # Pure question: answer it, re-deliver the prior package, generate nothing.
-                    st = {sk: "\n".join(a["uri"] for a in (prior_pkg.get("assets") or [])
-                                        if a.get("type") == kind and a.get("uri"))
-                          for kind, sk in _KIND_TO_STATE.items()}
-                    st["copy_full"] = prior_pkg.get("copy") or {}
-                    outputs = _build_outputs(st, live_url=live_url)
-                    answer = str(scope.get("summary") or "").strip()
-                    if answer:
-                        outputs["markdown"] = f"{answer}\n\n{outputs['markdown']}"
-                    if jid:
-                        try:
-                            escrow.update_job(jid, status="Delivered", package=dict(prior_pkg))
-                            escrow.add_event(jid, "Answered the buyer; re-delivered the approved package unchanged")
-                        except Exception:  # noqa: BLE001
-                            pass
-                    _cb({"status": "completed", "outputs": outputs})
+                nothing_to_generate = not (int(spec.get("image_count") or 0)
+                                           or (spec.get("videos") or [])
+                                           or int(spec.get("card_count") or 0))
+                if nothing_to_generate:
+                    # A question, or only unpaid kinds requested: answer/explain and re-deliver
+                    # the approved package. Free — it never counts against the revision budget.
+                    _note("📝 Revision needs no regeneration — answering and re-delivering "
+                          "the approved package", "stage")
+                    note = (_denied_note(denied, ru) if denied
+                            else str(scope.get("summary") or "").strip())
+                    _redeliver_prior(note, "Answered the buyer; re-delivered the approved package unchanged")
                     return
+                if revisions_used >= FREE_REVISIONS:
+                    # Budget exhausted: never burn more generation; re-deliver what was approved.
+                    print(f"{tag} revision limit reached ({revisions_used}/{FREE_REVISIONS})", flush=True)
+                    _note(f"🔒 Free revision limit reached ({revisions_used}/{FREE_REVISIONS}) — "
+                          "re-delivering the approved package unchanged", "stage")
+                    _redeliver_prior(_limit_note(revisions_used, ru),
+                                     "Revision limit reached; re-delivered the approved package")
+                    return
+                consumes_revision = True
+                _note("📝 Revision scoped: regenerating only " + ", ".join(redo)
+                      + f" — keeping {len(reused)} previously approved asset(s) "
+                      f"(revision {revisions_used + 1} of {FREE_REVISIONS})", "stage")
             else:
+                if prior_pkg.get("assets") and revisions_used >= FREE_REVISIONS:
+                    # Can't scope it AND no budget left -> never fall back to a full re-run.
+                    _note(f"🔒 Free revision limit reached ({revisions_used}/{FREE_REVISIONS}) — "
+                          "re-delivering the approved package unchanged", "stage")
+                    _redeliver_prior(_limit_note(revisions_used, ru),
+                                     "Revision limit reached; re-delivered the approved package")
+                    return
+                consumes_revision = True
                 _note("📝 Could not scope the revision — re-running the full order to be safe", "system")
 
         if not image_url:
@@ -397,6 +439,21 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
         if not (outputs.get("images") or outputs.get("videos") or outputs.get("cards")):
             _fail("generation produced no deliverable assets")
             return
+        if denied:
+            dn = _denied_note(denied, ru)
+            outputs["markdown"] = f"{outputs['markdown']}\n\n{dn}"
+            _note(dn, "system")
+        if consumes_revision:
+            # The revision delivered regenerated content — only now does it consume budget,
+            # and the buyer is told exactly how much remains.
+            bn = _budget_note(revisions_used + 1, ru)
+            outputs["markdown"] = f"{outputs['markdown']}\n\n{bn}"
+            _note(bn, "system")
+            if task_id:
+                try:
+                    escrow.bump_task_revisions(task_id)
+                except Exception:  # noqa: BLE001 — budget tracking must never break delivery
+                    pass
         if jid:
             try:
                 package = {
@@ -467,37 +524,90 @@ def _spec_from_inputs(inputs: dict) -> dict | None:
 
 
 def _scoped_spec(base: dict | None, scope: dict) -> dict:
-    """Narrow a production spec to ONLY what a revision regenerates.
+    """Narrow a production spec to ONLY what a revision regenerates — capped by the PAID scope.
 
     Kinds the buyer didn't ask to change get zeroed out (0 images / [] videos / 0 cards) — the
-    pipeline agents honor that and skip the work — while the buyer's explicit overrides
-    (language, counts, video kinds) are applied to the kinds being redone.
+    pipeline agents honor that and skip the work — and the kept assets are carried over from the
+    previous delivery. A revision is a correction, not a free top-up: a kind being redone can
+    never exceed the count the original order paid for, and a kind the order never included
+    stays at zero (see _denied_kinds / _denied_note for how that's communicated).
     """
     s = dict(base or default_spec())
     regen = scope.get("regenerate") or {}
-    if regen.get("images"):
-        if scope.get("image_count"):
-            s["image_count"] = max(1, min(int(scope["image_count"]), 20))
+    paid_images = int(s.get("image_count") or 0)
+    paid_videos = list(s.get("videos") or [])
+    paid_cards = int(s.get("card_count") or 0)
+    if regen.get("images") and paid_images:
+        req = int(scope.get("image_count") or paid_images)
+        s["image_count"] = max(1, min(req, paid_images))
     else:
         s["image_count"] = 0
-    if regen.get("videos"):
-        if scope.get("video_kinds"):
-            s["videos"] = [{"kind": str(k), "aspect_ratio": "9:16", "duration_seconds": 8}
-                           for k in scope["video_kinds"] if k]
-        if not s.get("videos"):  # asked to change videos but the order/scope named none -> one 360
-            s["videos"] = [{"kind": "360", "aspect_ratio": "9:16", "duration_seconds": 8}]
+    if regen.get("videos") and paid_videos:
+        kinds = [str(k) for k in (scope.get("video_kinds") or []) if k]
+        s["videos"] = ([{"kind": k, "aspect_ratio": "9:16", "duration_seconds": 8}
+                        for k in kinds[: len(paid_videos)]] or paid_videos)
     else:
         s["videos"] = []
-    if regen.get("cards"):
-        if scope.get("card_count"):
-            s["card_count"] = max(1, min(int(scope["card_count"]), 5))
-        elif not int(s.get("card_count") or 0):  # cards requested on an order that had none
-            s["card_count"] = 2
+    if regen.get("cards") and paid_cards:
+        req = int(scope.get("card_count") or paid_cards)
+        s["card_count"] = max(1, min(req, paid_cards))
     else:
         s["card_count"] = 0
     if scope.get("language"):
         s["language"] = str(scope["language"])
     return s
+
+
+def _is_ru(spec: dict | None, *texts: str) -> bool:
+    """Buyer-facing language pick: the order spec's language, else Cyrillic in the given texts."""
+    lang = str((spec or {}).get("language") or "").lower()
+    if lang.startswith("ru") or "рус" in lang:
+        return True
+    joined = " ".join(t for t in texts if t)
+    return sum(1 for c in joined if "Ѐ" <= c <= "ӿ") >= 3
+
+
+def _denied_kinds(base: dict | None, regen: dict) -> list[str]:
+    """Asset kinds the revision asked to (re)generate that the paid order never included."""
+    b = base or default_spec()
+    out: list[str] = []
+    if regen.get("images") and not int(b.get("image_count") or 0):
+        out.append("images")
+    if regen.get("videos") and not (b.get("videos") or []):
+        out.append("videos")
+    if regen.get("cards") and not int(b.get("card_count") or 0):
+        out.append("cards")
+    return out
+
+
+def _denied_note(denied: list[str], ru: bool) -> str:
+    names = ({"images": "изображения", "videos": "видео", "cards": "карточки товара"} if ru
+             else {"images": "images", "videos": "videos", "cards": "product cards"})
+    what = ", ".join(names[k] for k in denied)
+    if ru:
+        return (f"ℹ️ {what.capitalize()} не входили в оплаченный заказ, поэтому в рамках ревизии "
+                "не генерировались — их можно добавить отдельным заказом.")
+    return (f"ℹ️ {what.capitalize()} were not part of the paid order, so this revision did not "
+            "generate them — they can be added as a separate order.")
+
+
+def _limit_note(used: int, ru: bool) -> str:
+    if ru:
+        return (f"🔒 Лимит бесплатных ревизий по этому заказу исчерпан ({used} из {FREE_REVISIONS}), "
+                "поэтому ничего не перегенерировалось — прилагаю последнюю утверждённую версию "
+                "пакета. Для новых правок оформите, пожалуйста, отдельный заказ.")
+    return (f"🔒 The free revision limit for this order is used up ({used} of {FREE_REVISIONS}), so "
+            "nothing was regenerated — re-attaching the latest approved package. For further "
+            "changes, please place a new order.")
+
+
+def _budget_note(used_after: int, ru: bool) -> str:
+    left = max(0, FREE_REVISIONS - used_after)
+    if ru:
+        tail = "Это была последняя бесплатная ревизия." if left == 0 else f"Осталось бесплатных ревизий: {left}."
+        return f"♻️ Ревизия {used_after} из {FREE_REVISIONS}. {tail}"
+    tail = "That was the last free revision." if left == 0 else f"Free revisions left: {left}."
+    return f"♻️ Revision {used_after} of {FREE_REVISIONS}. {tail}"
 
 
 def _shortfall_note(spec: dict | None, outputs: dict) -> str | None:
@@ -582,7 +692,10 @@ async def marketplace_webhook(
                A revision is SCOPED, not re-run: an LLM classifier reads revisionInstructions and
                only the asset kinds the buyer wants changed are regenerated; the rest of the
                previously delivered package (found via task.id) is carried over. A pure question
-               re-delivers the prior package with the answer in the markdown.
+               re-delivers the prior package with the answer in the markdown. Each order includes
+               FREE_REVISIONS generation-consuming revisions (capped by the paid scope — never a
+               free top-up); past the limit the approved package is re-delivered with a polite
+               note, so a buyer can't endlessly burn the generation budget.
 
     A real order is NEVER answered with the "connected" stub, and a synchronous
     {status: "completed"} is only ever returned for the test handshake.
@@ -639,11 +752,14 @@ async def marketplace_webhook(
     # _run_marketplace_job then scopes the revision to only the asset kinds the buyer wants changed.
     revision = _first(task, ["revisionInstructions", "revision_instructions", "feedback"])
     prior_jid = ""
+    revisions_used = 0
     if revision:
         brief = f"{brief}\n\nRevision requested by buyer: {revision}".strip()
         try:
             prior_jid = ((task_id and escrow.job_id_for_task(task_id))
                          or (delivery_id and escrow.job_id_for_delivery(str(delivery_id))) or "")
+            if task_id:
+                revisions_used = escrow.task_revision_count(task_id)
         except Exception:  # noqa: BLE001 — lookup is best-effort; worst case we re-run in full
             prior_jid = ""
 
@@ -671,10 +787,12 @@ async def marketplace_webhook(
     if delivery_id:
         escrow.map_delivery(str(delivery_id), jid)
     if task_id:
-        escrow.map_task(task_id, jid)
+        # fresh=True on a new order resets the free-revision counter for this task.
+        escrow.map_task(task_id, jid, fresh=not revision)
     live_url = f"{SERVICE_URL}/live/{jid}"
     _dispatch(_run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token,
-                                   delivery_id, jid=jid, revision_text=revision, prior_jid=prior_jid))
+                                   delivery_id, jid=jid, revision_text=revision, prior_jid=prior_jid,
+                                   task_id=task_id, revisions_used=revisions_used))
     return {"status": "accepted", "liveUrl": live_url,
             "note": f"Watch the agent think & work live: {live_url}"}
 

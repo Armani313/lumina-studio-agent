@@ -5,11 +5,19 @@ the marketplace quotes a price from it (base + per-asset) before funding escrow.
 """
 from __future__ import annotations
 
+import os
+
 # Per-item pricing (USD). Quote = BASE + per-image + per-video + per-card.
 BASE_PRICE = 7
 PER_IMAGE = 1
 PER_VIDEO = 2
 PER_CARD = 1
+
+# Revision policy: how many generation-consuming revisions an order includes. Each revision
+# regenerates ONLY what the buyer asks to change, capped by the paid scope; questions are free
+# and unlimited. Past the limit the approved package is re-delivered unchanged with a polite
+# note — the buyer can't burn our Imagen/Veo budget with endless free re-rolls.
+FREE_REVISIONS = int(os.getenv("FREE_REVISIONS", "3"))
 
 
 def price_for_spec(spec: dict) -> int:

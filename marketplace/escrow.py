@@ -95,13 +95,29 @@ def job_id_for_delivery(delivery_id: str) -> str | None:
 TASK_MAP = "marketplace_task_map"
 
 
-def map_task(task_id: str, jid: str) -> None:
+def map_task(task_id: str, jid: str, fresh: bool = False) -> None:
     """Remember the newest job serving a marketplace TASK id.
 
     A revision arrives with a NEW deliveryId but the SAME task.id, so this map — not the
-    delivery map — is how task.revision_requested finds the package it must amend.
+    delivery map — is how task.revision_requested finds the package it must amend. The doc
+    also carries the order's revision counter: `fresh=True` (task.created) resets it, and
+    revisions that actually regenerate content bump it via bump_task_revisions().
     """
-    db().collection(TASK_MAP).document(_safe_doc_id(task_id)).set({"job_id": jid, "at": _now()})
+    doc: dict = {"job_id": jid, "at": _now()}
+    if fresh:
+        doc["revisions"] = 0
+    db().collection(TASK_MAP).document(_safe_doc_id(task_id)).set(doc, merge=True)
+
+
+def bump_task_revisions(task_id: str) -> None:
+    """Count one generation-consuming revision against the task's free-revision budget."""
+    db().collection(TASK_MAP).document(_safe_doc_id(task_id)).set(
+        {"revisions": firestore.Increment(1)}, merge=True)
+
+
+def task_revision_count(task_id: str) -> int:
+    snap = db().collection(TASK_MAP).document(_safe_doc_id(task_id)).get()
+    return int((snap.to_dict() or {}).get("revisions") or 0)
 
 
 def job_id_for_task(task_id: str) -> str | None:
