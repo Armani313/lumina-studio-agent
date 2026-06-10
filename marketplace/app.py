@@ -126,24 +126,46 @@ def _post_callback(url: str, token: str, body: dict) -> None:
         pass
 
 
-def _build_outputs(state: dict) -> dict:
+def _build_outputs(state: dict, live_url: str = "") -> dict:
     """Map the agent's delivered package into marketplace outputs (viewable proxy URLs + copy)."""
     assets = escrow.extract_assets(state)
     images = [_proxy_url(a["uri"]) for a in assets if a["type"] == "image"]
     videos = [_proxy_url(a["uri"]) for a in assets if a["type"] == "video"]
     cards = [_proxy_url(a["uri"]) for a in assets if a["type"] == "card"]
     copy = state.get("copy_full") or state.get("copy_doc") or {}
-    title = copy.get("title") if isinstance(copy, dict) else ""
+    cp = copy if isinstance(copy, dict) else {}
+    brief = state.get("brief") if isinstance(state.get("brief"), dict) else {}
+    ru = "rus" in (brief.get("language") or "").lower() or "рус" in (brief.get("language") or "").lower()
+    lbl_desc = "Описание товара" if ru else "Product description"
+    lbl_feat = "Ключевые характеристики" if ru else "Key features"
+    lbl_kw = "SEO-ключи" if ru else "SEO keywords"
+    title = cp.get("title") or ""
     md = [f"## {title}" if title else "## Your on-brand content package"]
-    if isinstance(copy, dict) and copy.get("short"):
-        md.append(copy["short"])
+    if cp.get("short"):
+        md.append(cp["short"])
+    # Ready-to-paste marketplace listing copy (SEO description, features, keywords). These were
+    # generated all along but previously omitted from the rendered markdown, so the buyer's storefront
+    # only ever showed the title + tagline.
+    if cp.get("long"):
+        md.append(f"**{lbl_desc}**\n\n{cp['long']}")
+    if isinstance(cp.get("bullets"), list) and cp["bullets"]:
+        md.append(f"**{lbl_feat}**\n" + "\n".join(f"- {b}" for b in cp["bullets"]))
+    if isinstance(cp.get("keywords"), list) and cp["keywords"]:
+        md.append(f"**{lbl_kw}:** " + ", ".join(str(k) for k in cp["keywords"]))
     if images:
         md.append("**Images**\n" + "\n".join(f"![image]({u})" for u in images))
     if cards:
         md.append("**Product cards**\n" + "\n".join(f"![card]({u})" for u in cards))
     if videos:
         md.append("**Videos**\n" + "\n".join(f"- [video]({u})" for u in videos))
-    return {"markdown": "\n\n".join(md), "images": images, "cards": cards, "videos": videos, "copy": copy}
+    if live_url:
+        lbl = ("🧠 Как создавался ваш пакет — журнал мыслей и работы агента" if ru
+               else "🧠 How it was made — the agent's live thinking log")
+        md.append(f"---\n\n[{lbl}]({live_url})")
+    out = {"markdown": "\n\n".join(md), "images": images, "cards": cards, "videos": videos, "copy": copy}
+    if live_url:
+        out["liveUrl"] = live_url
+    return out
 
 
 # --- Background agent jobs share ONE long-lived event loop ------------------
@@ -195,29 +217,54 @@ def _dispatch(coro) -> None:
 
 
 async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_link: str,
-                               cb_url: str, cb_token: str, delivery_id: str = "") -> None:
+                               cb_url: str, cb_token: str, delivery_id: str = "",
+                               jid: str = "") -> None:
     """Background: run the full agent for an external-marketplace task, then POST the result.
 
     Always finishes with exactly one callback: {status: "completed", outputs} once real assets
     exist, otherwise {status: "failed", error}. Never reports a hollow completion.
+
+    The run is also narrated into escrow job `jid` (same feed as the local UI), which powers the
+    public buyer-facing live page /live/{jid} — escrow writes are best-effort and must never
+    break the callback contract.
     """
     tag = f"[mkt-job {delivery_id or '-'}]"
+    live_url = f"{SERVICE_URL}/live/{jid}" if jid else ""
 
     def _cb(body: dict) -> None:
         if delivery_id:
             body.setdefault("deliveryId", delivery_id)
+        if live_url:
+            body.setdefault("liveUrl", live_url)
         extra = f" error={body['error']!r}" if body.get("status") == "failed" else ""
         print(f"{tag} -> callback status={body.get('status')}{extra}", flush=True)
         _post_callback(cb_url, cb_token, body)
 
-    print(f"{tag} start image_url={(image_url or '')[:90]!r} brief={(brief or '')[:80]!r}", flush=True)
+    def _note(msg: str, kind: str = "system") -> None:
+        if jid:
+            try:
+                escrow.add_event(jid, msg, kind=kind)
+            except Exception:  # noqa: BLE001 — live feed is cosmetic; the job must go on
+                pass
+
+    def _fail(err: str) -> None:
+        if jid:
+            try:
+                escrow.update_job(jid, status="Failed")
+                escrow.add_event(jid, f"Failed: {err[:160]}")
+            except Exception:  # noqa: BLE001
+                pass
+        _cb({"status": "failed", "error": err})
+
+    print(f"{tag} start image_url={(image_url or '')[:90]!r} brief={(brief or '')[:80]!r}"
+          f" live={live_url or '-'}", flush=True)
     try:
         if not image_url:
-            _cb({"status": "failed", "error": "no product image in task inputs or attachments"})
+            _fail("no product image in task inputs or attachments")
             return
         product_uri = _fetch_image_to_gcs(image_url)
         if not product_uri:
-            _cb({"status": "failed", "error": "could not fetch product image"})
+            _fail("could not fetch product image")
             return
         full_brief = brief if not brand_link else f"{brief}\nBrand link: {brand_link}"
         seed = {"product_image_uri": product_uri, "brief_text": full_brief, "brand_link": brand_link}
@@ -229,22 +276,43 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
         uid = uuid.uuid4().hex
         session = await runner.session_service.create_session(app_name="lumina_ext", user_id=uid, state=seed)
         msg = types.Content(role="user", parts=[types.Part(text=full_brief)])
-        async for _ in runner.run_async(user_id=uid, session_id=session.id, new_message=msg):
-            pass
+        seen: set[str] = set()
+        last: tuple[str, str] | None = None
+        # Narrate the run into the live feed exactly like the local UI does (_run_job).
+        async for ev in runner.run_async(user_id=uid, session_id=session.id, new_message=msg):
+            for kind, line in _narrate_event(ev, seen):
+                if (kind, line) == last:
+                    continue  # collapse consecutive duplicates (model re-emits prose across chunks)
+                last = (kind, line)
+                _note(line, kind)
         st = dict((await runner.session_service.get_session(
             app_name="lumina_ext", user_id=uid, session_id=session.id)).state)
-        outputs = _build_outputs(st)
+        outputs = _build_outputs(st, live_url=live_url)
         print(f"{tag} agent done; assets images={len(outputs.get('images') or [])} "
               f"cards={len(outputs.get('cards') or [])} videos={len(outputs.get('videos') or [])}", flush=True)
         # Guard: never report a hollow "completed" with no media (the original failure class).
         if not (outputs.get("images") or outputs.get("videos") or outputs.get("cards")):
-            _cb({"status": "failed", "error": "generation produced no deliverable assets"})
+            _fail("generation produced no deliverable assets")
             return
+        if jid:
+            try:
+                package = {
+                    "assets": escrow.extract_assets(st),
+                    "copy": st.get("copy_full") or st.get("copy_doc"),
+                    "qa_report": st.get("qa_report"),
+                    "qa_scores": st.get("qa_scores") or [],
+                }
+                # Plain "Delivered" (not set_delivered): for external orders acceptance/escrow
+                # release happens on the marketplace, so its wording doesn't apply here.
+                escrow.update_job(jid, status="Delivered", package=package)
+                escrow.add_event(jid, "Package delivered to the marketplace")
+            except Exception:  # noqa: BLE001
+                pass
         _cb({"status": "completed", "outputs": outputs})
     except Exception as e:  # noqa: BLE001
         import traceback
         print(f"{tag} EXCEPTION {e!r}\n{traceback.format_exc()}", flush=True)
-        _cb({"status": "failed", "error": str(e)[:300]})
+        _fail(str(e)[:300])
 
 
 def _quote_cents(spec: dict, min_cents: int = 0) -> int:
@@ -328,8 +396,9 @@ async def marketplace_webhook(
       • consult.message                      -> synchronous text reply (+ optional proposal)
       • task.test / connection check         -> synchronous "connected" stub (the ONLY stub)
       • task.created / task.revision_requested (real orders)
-            -> respond {status: "accepted"} now; the finished package is POSTed to
-               callback.url (Bearer callback.bearerToken) within the offer's ETA.
+            -> respond {status: "accepted", liveUrl} now; the finished package is POSTed to
+               callback.url (Bearer callback.bearerToken) within the offer's ETA. liveUrl is
+               a public read-only page streaming the agent's work (see docs/LIVE_VIEW_INTEGRATION.md).
 
     A real order is NEVER answered with the "connected" stub, and a synchronous
     {status: "completed"} is only ever returned for the test handshake.
@@ -389,8 +458,24 @@ async def marketplace_webhook(
         return {"status": "ignored", "note": f"no actionable order in event '{event or 'unknown'}'"}
 
     # Real order: long-running -> accept now; deliver (or report failure) via async callback.
-    _dispatch(_run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token, delivery_id))
-    return {"status": "accepted"}
+    # Also register it as an escrow job BEFORE accepting, so the buyer-facing live page exists
+    # the moment the marketplace renders our response: /live/{jid} (or the template-able
+    # /live/d/{deliveryId}) streams the agent's thinking feed while the order is produced.
+    spec = _spec_from_inputs(inputs)
+    jid = escrow.create_job(
+        brief or "Marketplace order",
+        image_url,
+        brand_link,
+        price=(_quote_cents(spec) // 100) if spec else 0,
+        extra={"delivery_id": str(delivery_id or ""), "source": "external"},
+    )
+    if delivery_id:
+        escrow.map_delivery(str(delivery_id), jid)
+    live_url = f"{SERVICE_URL}/live/{jid}"
+    _dispatch(_run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token,
+                                   delivery_id, jid=jid))
+    return {"status": "accepted", "liveUrl": live_url,
+            "note": f"Watch the agent think & work live: {live_url}"}
 
 
 @app.get("/api/marketplace/inbound")
@@ -434,6 +519,36 @@ def accept(jid: str):
     if not escrow.accept_job(jid):
         raise HTTPException(400, "job not in Delivered state")
     return {"ok": True}
+
+
+# --- Public live view ("watch the agent work") --------------------------------
+# Read-only, no auth: the job id is an unguessable random token, so the link itself is the
+# capability. Shared with the buyer on an external marketplace via the `liveUrl` field /
+# the delivery markdown, or constructed by the platform as /live/d/{deliveryId}.
+
+
+@app.get("/live/{jid}", response_class=HTMLResponse)
+def live_view(jid: str) -> str:
+    """Buyer-facing live page: streams the agent's thinking feed, QA verdicts and previews."""
+    return LIVE_HTML
+
+
+@app.get("/live/d/{delivery_id}", response_class=HTMLResponse)
+def live_view_by_delivery(delivery_id: str) -> str:
+    """Same live page, addressed by the marketplace's own deliveryId (template-able URL).
+
+    The page resolves the deliveryId to a job client-side and waits politely if our webhook
+    hasn't created the job yet — so the marketplace may render this link immediately.
+    """
+    return LIVE_HTML
+
+
+@app.get("/api/jobs/by-delivery/{delivery_id}")
+def job_by_delivery(delivery_id: str):
+    jid = escrow.job_id_for_delivery(delivery_id)
+    if not jid:
+        raise HTTPException(404, "no job for this delivery yet")
+    return {"job_id": jid}
 
 
 @app.post("/api/consult")
@@ -955,6 +1070,143 @@ $('#acceptBtn').addEventListener('click', async () => {
   $('#acceptBtn').classList.add('hidden');
   poll();
 });
+</script>
+</body>
+</html>"""
+
+
+# Public read-only "watch the agent work" page served at /live/{jid} and /live/d/{deliveryId}.
+# Same thinking-feed rendering as INDEX_HTML's job panel, minus anything actionable (no accept
+# button, no escrow controls) — safe to share with a buyer or embed in a marketplace iframe.
+LIVE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lumina Studio — agent at work</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-stone-100 text-stone-800">
+<div class="max-w-3xl mx-auto p-4 sm:p-6">
+  <div class="flex items-center justify-between gap-3">
+    <h1 class="text-lg font-semibold tracking-tight">Lumina Studio <span class="text-stone-400">— agent at work</span></h1>
+    <span id="status" class="text-xs px-2 py-1 rounded-full bg-stone-200"></span>
+  </div>
+
+  <div id="wait" class="mt-6 bg-white rounded-xl shadow-sm p-5 text-sm text-stone-500 flex items-center gap-2">
+    <span class="inline-block h-3 w-3 border-2 border-stone-400 border-t-transparent rounded-full animate-spin"></span>
+    <span id="waitMsg">Waiting for the agent to pick up this order…</span>
+  </div>
+
+  <div id="panel" class="mt-6 hidden bg-white rounded-xl shadow-sm p-5">
+    <div id="now" class="text-sm text-stone-700 flex items-center gap-2 flex-wrap"></div>
+    <div id="thinking" class="mt-3 hidden">
+      <div class="text-[11px] uppercase tracking-wide text-stone-400 font-medium">Agent thinking — live</div>
+      <ol id="events" class="mt-1 text-xs leading-relaxed space-y-0.5 max-h-80 overflow-auto pr-1"></ol>
+    </div>
+    <div id="copy" class="mt-4 text-sm hidden"></div>
+    <div id="scorecard" class="mt-4 hidden"></div>
+    <div id="gallery" class="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-3"></div>
+  </div>
+
+  <p class="mt-3 text-[11px] text-stone-400">Read-only view. Your deliverables arrive in your marketplace order — this page shows how they're being made.</p>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const m = location.pathname.match(/\\/live\\/(?:(d)\\/)?([^\\/?#]+)/);
+let jid = m && !m[1] ? m[2] : null;
+const deliveryId = m && m[1] ? m[2] : null;
+let timer = null;
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function evClass(k){ return ({
+  stage: 'text-stone-800 font-medium mt-2',
+  reason: 'text-violet-600 pl-4',
+  act: 'text-stone-500 pl-4',
+  verdict: 'text-emerald-600 pl-4',
+  'verdict-fail': 'text-amber-600 pl-4',
+  think: 'text-stone-500 italic pl-4',
+})[k] || 'text-stone-400'; }
+function evMark(k){
+  if(k==='reason') return '<span class="text-violet-300">💭 </span>';
+  if(k==='act') return '<span class="text-stone-300">↳ </span>';
+  if(k==='stage'||k==='verdict'||k==='verdict-fail'||k==='think') return '';
+  return '<span class="text-stone-300">• </span>';
+}
+function badge(text, cls){ const el=$('#status'); el.textContent=text; el.className='text-xs px-2 py-1 rounded-full '+cls; }
+
+async function resolveDelivery(){
+  try{
+    const r = await fetch('/api/jobs/by-delivery/' + encodeURIComponent(deliveryId));
+    if(r.ok){ jid = (await r.json()).job_id; start(); return; }
+  }catch(e){}
+  setTimeout(resolveDelivery, 3000);
+}
+
+function start(){
+  $('#wait').classList.add('hidden');
+  $('#panel').classList.remove('hidden');
+  poll(); timer = setInterval(poll, 2500);
+}
+
+async function poll(){
+  let j;
+  try{
+    const r = await fetch('/api/jobs/' + jid);
+    if(!r.ok) return;
+    j = await r.json();
+  }catch(e){ return; }
+
+  badge(j.status, j.status==='Completed' || j.status==='Delivered' ? 'bg-emerald-100 text-emerald-800' :
+        j.status==='Failed' ? 'bg-red-100 text-red-700' : 'bg-stone-200 text-stone-700');
+
+  const evs = j.events || [];
+  $('#thinking').classList.toggle('hidden', evs.length === 0);
+  $('#events').innerHTML = evs.map(e => '<li class="'+evClass(e.kind||'system')+'">'+evMark(e.kind||'system')+escapeHtml(e.msg)+'</li>').join('');
+  const evBox = $('#events'); evBox.scrollTop = evBox.scrollHeight;
+
+  const inProg = j.status==='InProgress';
+  const lastEv = evs[evs.length-1];
+  let lastStage = null; for(let i=evs.length-1;i>=0;i--){ if((evs[i].kind||'')==='stage'){ lastStage = evs[i]; break; } }
+  const t0 = j.created_at ? Date.parse(j.created_at) : Date.now();
+  const elapsed = Math.max(0, Math.floor((Date.now()-t0)/1000));
+  const mm = Math.floor(elapsed/60), ss = String(elapsed%60).padStart(2,'0');
+  const spin = '<span class="inline-block h-3 w-3 border-2 border-stone-400 border-t-transparent rounded-full animate-spin"></span>';
+  const head = lastStage ? lastStage.msg : (lastEv ? lastEv.msg : 'Starting…');
+  const subRaw = (lastEv && lastEv !== lastStage) ? lastEv.msg : '';
+  const sub = subRaw.length > 100 ? subRaw.slice(0, 99) + '…' : subRaw;
+  $('#now').innerHTML = (inProg ? spin : '') +
+    '<span class="font-medium text-stone-800">'+escapeHtml(head)+'</span>' +
+    (sub ? ' <span class="text-stone-400">— '+escapeHtml(sub)+'</span>' : '') +
+    (inProg ? ' <span class="text-stone-400">· '+mm+':'+ss+'</span>' : '');
+
+  const sc = (j.package && j.package.qa_scores) || [];
+  if(sc.length){ $('#scorecard').classList.remove('hidden'); $('#scorecard').innerHTML = '<div class="font-medium text-sm">Quality scorecard</div>' + sc.map((s,i)=>'<div class="text-xs flex justify-between border-b border-stone-100 py-1"><span>'+(s.verdict==='pass'?'✓':'✗')+' Asset '+(i+1)+'</span><span class="font-mono text-stone-500">'+Math.round((s.score||0)*100)+'%</span></div>').join(''); }
+
+  if(j.package){
+    const a = j.package.assets || [];
+    $('#gallery').innerHTML = a.map((x,i) => {
+      const src = '/api/asset?uri=' + encodeURIComponent(x.uri);
+      return x.type==='video'
+        ? `<video controls playsinline preload="metadata" class="rounded-lg w-full bg-black" src="${src}"></video>`
+        : `<img class="rounded-lg w-full" src="${src}">`;
+    }).join('');
+    const cp = j.package.copy;
+    if(cp && typeof cp === 'object'){
+      $('#copy').classList.remove('hidden');
+      let h = '<div class="font-medium text-sm">Marketing copy</div>';
+      if(cp.title) h += '<div class="mt-2 font-semibold text-stone-800">'+escapeHtml(cp.title)+'</div>';
+      if(cp.short) h += '<div class="text-sm text-stone-600">'+escapeHtml(cp.short)+'</div>';
+      $('#copy').innerHTML = h;
+    }
+  }
+
+  if(j.status==='Delivered' || j.status==='Completed' || j.status==='Failed'){ clearInterval(timer); }
+}
+
+if(jid){ start(); }
+else if(deliveryId){ resolveDelivery(); }
+else { $('#waitMsg').textContent = 'Invalid link.'; }
 </script>
 </body>
 </html>"""

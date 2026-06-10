@@ -47,6 +47,11 @@ The same agent is integrated with a **live third-party marketplace** (`aifreelan
 open webhook contract (**Simple Webhook v1.1**) plus a discoverable **A2A AgentCard**, so it can be
 found, hired, and paid from outside our own UI — the bridge to an agent-to-agent economy.
 
+Buyers on that marketplace can **watch the agent think and work live**: every order gets a public
+read-only page (`/live/d/{deliveryId}`) streaming stages, the model's reasoning, tool actions, QA
+verdicts and previews. One link, zero integration effort — see
+[docs/LIVE_VIEW_INTEGRATION.md](docs/LIVE_VIEW_INTEGRATION.md).
+
 ## How Lumina works — multi-agent architecture (ADK)
 
 A root `SequentialAgent` orchestrates the pipeline, using all three ADK workflow patterns

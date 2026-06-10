@@ -35,22 +35,24 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
 
-def create_job(brief: str, product_image_uri: str, brand_link: str, price: int) -> str:
+def create_job(brief: str, product_image_uri: str, brand_link: str, price: int,
+               extra: dict | None = None) -> str:
     jid = uuid.uuid4().hex[:12]
-    db().collection(JOBS).document(jid).set(
-        {
-            "id": jid,
-            "brief": brief,
-            "product_image_uri": product_image_uri,
-            "brand_link": brand_link,
-            "price": price,
-            "status": IN_PROGRESS,
-            "escrow": FUNDED,
-            "package": None,
-            "created_at": _now(),
-            "events": [{"t": _now(), "msg": "Order funded; escrow held; dispatched to agent", "kind": "system"}],
-        }
-    )
+    doc = {
+        "id": jid,
+        "brief": brief,
+        "product_image_uri": product_image_uri,
+        "brand_link": brand_link,
+        "price": price,
+        "status": IN_PROGRESS,
+        "escrow": FUNDED,
+        "package": None,
+        "created_at": _now(),
+        "events": [{"t": _now(), "msg": "Order funded; escrow held; dispatched to agent", "kind": "system"}],
+    }
+    if extra:
+        doc.update(extra)
+    db().collection(JOBS).document(jid).set(doc)
     return jid
 
 
@@ -67,6 +69,27 @@ def add_event(jid: str, msg: str, kind: str = "system") -> None:
     db().collection(JOBS).document(jid).update(
         {"events": firestore.ArrayUnion([{"t": _now(), "msg": msg, "kind": kind}])}
     )
+
+
+DELIVERY_MAP = "marketplace_delivery_map"
+
+
+def _safe_doc_id(s: str) -> str:
+    return re.sub(r"[/\s]+", "_", str(s))[:512] or "none"
+
+
+def map_delivery(delivery_id: str, jid: str) -> None:
+    """Remember which job serves a marketplace deliveryId (enables /live/d/{deliveryId}).
+
+    Revisions re-map the same deliveryId to the newest run, so the buyer's live link always
+    shows the current work.
+    """
+    db().collection(DELIVERY_MAP).document(_safe_doc_id(delivery_id)).set({"job_id": jid, "at": _now()})
+
+
+def job_id_for_delivery(delivery_id: str) -> str | None:
+    snap = db().collection(DELIVERY_MAP).document(_safe_doc_id(delivery_id)).get()
+    return (snap.to_dict() or {}).get("job_id") if snap.exists else None
 
 
 def log_inbound(payload: dict) -> str:

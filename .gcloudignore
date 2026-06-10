@@ -1,4 +1,6 @@
 # Keep the Cloud Run source upload small. (.env is NOT used — env comes via --set-env-vars.)
+# The image itself only ever contains requirements.txt + lumina/ + marketplace/ (see Dockerfile
+# COPY lines); everything here just trims the Cloud Build context upload.
 .venv/
 __pycache__/
 *.pyc
@@ -6,8 +8,17 @@ outputs/
 *.png
 *.jpg
 *.mp4
+*.svg
 .git/
+.claude/
 .env
+gcp.env
+.gitignore
+.DS_Store
+docs/
+assets/
+*.md
+requirements-agent.txt
 test_remote.py
 run_slice.py
 test_video_clips.py
