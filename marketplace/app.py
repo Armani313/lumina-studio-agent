@@ -107,7 +107,8 @@ def _proxy_url(gs_uri: str) -> str:
 def _fetch_image_to_gcs(url: str) -> str | None:
     """Download a buyer-provided product image URL into our bucket; return its gs:// URI."""
     try:
-        r = httpx.get(url, timeout=45, follow_redirects=True)
+        # Browser-like headers: CDNs/shops with bot protection 403 the default httpx user agent.
+        r = httpx.get(url, timeout=45, follow_redirects=True, headers=consult_engine.BROWSER_HEADERS)
         r.raise_for_status()
         ct = (r.headers.get("content-type") or "").lower()
         ext = "png" if "png" in ct else ("webp" if "webp" in ct else "jpg")

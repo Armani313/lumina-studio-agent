@@ -43,6 +43,11 @@ _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif")
 # Login-walled platforms: their pages can't be fetched by url_context (or anything unauthenticated),
 # so we go straight to Google Search and, failing that, ask the customer for screenshots.
 _WALLED_HOSTS = ("instagram.com", "facebook.com", "fb.com", "tiktok.com", "x.com", "twitter.com", "threads.net")
+# Many CDNs / shops 403 the default python-httpx user agent; fetch like a regular browser.
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.8",
+}
 
 # Studied content is cached by source URL/URI so a multi-turn chat (especially the stateless
 # external webhook, which replays full history every turn) never re-analyses the same photo/link.
@@ -100,17 +105,28 @@ def _parse_json(text: str) -> dict:
         return {}
 
 
-def _image_part(url_or_uri: str) -> types.Part | None:
-    """A genai image Part from a gs:// URI (Vertex fetches it) or an http(s) URL (we download it)."""
+def _image_part(url_or_uri: str) -> tuple[types.Part | None, str]:
+    """A genai image Part from a gs:// URI (Vertex fetches it) or an http(s) URL (we download it).
+
+    Returns (part, fail_reason): reason is "" on success, "bot_blocked" when the host clearly
+    refuses automated access (401/403/429, a Cloudflare challenge, or an HTML page where an image
+    should be), "error" for anything else.
+    """
     if url_or_uri.startswith("gs://"):
-        return types.Part.from_uri(file_uri=url_or_uri, mime_type=mime_for_uri(url_or_uri))
+        return types.Part.from_uri(file_uri=url_or_uri, mime_type=mime_for_uri(url_or_uri)), ""
     try:
-        r = httpx.get(url_or_uri, timeout=20, follow_redirects=True)
+        r = httpx.get(url_or_uri, timeout=20, follow_redirects=True, headers=BROWSER_HEADERS)
+        if r.status_code in (401, 403, 429) or (
+            r.status_code == 503 and ("cf-ray" in r.headers or "cloudflare" in (r.headers.get("server") or "").lower())
+        ):
+            return None, "bot_blocked"
         r.raise_for_status()
-        mime = (r.headers.get("content-type") or "image/png").split(";", 1)[0].strip()
-        return types.Part.from_bytes(data=r.content, mime_type=mime or "image/png")
+        mime = (r.headers.get("content-type") or "image/png").split(";", 1)[0].strip().lower()
+        if mime.startswith("text/"):  # expected an image, got an HTML challenge/login page
+            return None, "bot_blocked"
+        return types.Part.from_bytes(data=r.content, mime_type=mime or "image/png"), ""
     except Exception:
-        return None
+        return None, "error"
 
 
 _IMG_STUDY_PROMPT = (
@@ -132,9 +148,11 @@ def study_image(url_or_uri: str) -> dict:
     """Vision-analyse a product photo or design/reference image. Cached by source."""
     if url_or_uri in _STUDY_CACHE:
         return _STUDY_CACHE[url_or_uri]
-    part = _image_part(url_or_uri)
+    part, fail = _image_part(url_or_uri)
     if part is None:
-        res = {"ok": False, "url": url_or_uri, "error": "could not load image"}
+        res = {"ok": False, "url": url_or_uri, "media": "image", "error": "could not load image"}
+        if fail == "bot_blocked":
+            res["bot_blocked"] = True
         _STUDY_CACHE[url_or_uri] = res
         return res
     try:
@@ -244,8 +262,16 @@ def study_page(url: str) -> dict:
             ),
         )
         data = _parse_json(resp.text)
+        # Ground truth from the tool itself: if retrieval ERRORed, the model never saw the page —
+        # whatever it "extracted" is training-data hallucination. Distrust it and flag the block.
+        fetch_failed = False
+        try:
+            metas = (resp.candidates[0].url_context_metadata.url_metadata or []) if resp.candidates else []
+            fetch_failed = bool(metas) and all("ERROR" in str(m.url_retrieval_status) for m in metas)
+        except Exception:
+            pass
         res = {
-            "ok": bool(data) and data.get("accessible", True) is not False,
+            "ok": bool(data) and data.get("accessible", True) is not False and not fetch_failed,
             "url": url,
             "media": "page",
             "summary": str(data.get("summary") or "").strip(),
@@ -253,6 +279,8 @@ def study_page(url: str) -> dict:
             "tone": data.get("tone") or "",
             "style": str(data.get("style") or "").strip(),
         }
+        if fetch_failed:
+            res["bot_blocked"] = True  # site refused the fetcher (anti-bot / wall), not just thin content
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "url": url, "media": "page", "error": str(e)[:160]}
     if not res["ok"]:  # fetch refused/failed (bot-blocked site etc.) — try learning via Search
@@ -271,7 +299,7 @@ def study_link(url: str) -> dict:
         return study_page(url)
     # Quick content-type probe so a bare image URL (no extension) is still vision-analysed.
     try:
-        head = httpx.head(url, timeout=8, follow_redirects=True)
+        head = httpx.head(url, timeout=8, follow_redirects=True, headers=BROWSER_HEADERS)
         if _looks_like_image(url, head.headers.get("content-type", "")):
             return study_image(url)
     except Exception:
@@ -374,6 +402,13 @@ def study_all(photo_url: str | None, message: str, history: list[dict], deadline
                     "search found nothing about this account. Say so honestly and ask for a SCREENSHOT "
                     "of the profile/page or 2-3 product photos instead (you can study images)."
                 )
+            elif r and r.get("bot_blocked"):
+                what = "image" if r.get("media") == "image" else "site"
+                fact_lines.append(
+                    f"SHARED LINK ({url}): this {what} has BOT PROTECTION — it actively refused automated "
+                    "access. Tell the customer EXPLICITLY that their link is protected from bots so you "
+                    "could not open it, and ask them to upload the photo/screenshot directly in the chat."
+                )
             else:
                 fact_lines.append(f"SHARED LINK ({url}): could NOT be read — ask the customer to describe it or share another.")
 
@@ -393,10 +428,13 @@ _SYSTEM = (
     "— faithful to the real product and the brand.\n"
     "You CHAT with the customer to understand their wishes and agree the SCOPE + PRICE.\n\n"
     "YOU CAN PERCEIVE THE CUSTOMER'S CONTENT: the photo they uploaded is vision-analysed and any "
-    "link they paste is fetched and read for you (see STUDIED CONTENT below). When you have studied "
+    "link they paste is fetched and read for you — web pages are read, direct image links (a product "
+    "photo as a URL) are vision-analysed (see STUDIED CONTENT below). When you have studied "
     "something, OPEN by reflecting one concrete observation back (a product detail, the site's "
     "palette/tone) so the customer feels understood — never claim to see things that aren't in "
-    "STUDIED CONTENT.\n\n"
+    "STUDIED CONTENT. If STUDIED CONTENT says a link is bot-protected or login-walled, tell the "
+    "customer EXPLICITLY that the site blocks automated access, and ask for a direct upload "
+    "(photo/screenshot) instead — never pretend you saw it.\n\n"
     "RULES:\n"
     "- Reply in the SAME LANGUAGE as the customer's latest message.\n"
     "- ONE warm, concise, expert reply (≈ ≤ 700 chars). Be a consultant, not a form.\n"
@@ -512,4 +550,10 @@ def run_consult(
             if r.get("media") == "page":
                 spec["brand_link"] = r["url"]
                 break
+    # Likewise the product photo when it arrived as a LINK in chat (no uploaded attachment):
+    # the studied image URL becomes the order's product image.
+    if spec is not None and not spec.get("product_image_url"):
+        p = studied.get("product")
+        if p and p.get("media") == "image" and str(p.get("url") or "").startswith(("http://", "https://", "gs://")):
+            spec["product_image_url"] = p["url"]
     return {"text": text, "propose": propose and spec is not None, "spec": spec, "etaMinutes": eta, "studied": studied}
