@@ -17,8 +17,11 @@ Design split: this module does the *dialogue + live study* and returns a decisio
 from __future__ import annotations
 
 import concurrent.futures
+import ipaddress
 import json
 import re
+import socket
+from urllib.parse import urlsplit
 
 import httpx
 from google.genai import types
@@ -53,6 +56,70 @@ BROWSER_HEADERS = {
 # Studied content is cached by source URL/URI so a multi-turn chat (especially the stateless
 # external webhook, which replays full history every turn) never re-analyses the same photo/link.
 _STUDY_CACHE: dict[str, dict] = {}
+
+
+def is_public_http_url(url: str) -> bool:
+    """True only for http(s) URLs whose host resolves exclusively to PUBLIC IP addresses.
+
+    SSRF guard for every server-side fetch of a user-supplied URL (buyer product photo, brand
+    link, consult message). Blocks loopback, private (RFC1918), link-local — including the cloud
+    metadata server 169.254.169.254 — and other non-global ranges, plus *.internal/*.local and
+    bare 'localhost'/'metadata' hostnames. Fails closed: anything we can't positively confirm as
+    public is rejected.
+    """
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
+    host = parts.hostname.lower().rstrip(".")
+    if host in ("localhost", "metadata", "metadata.google.internal") or host.endswith((".internal", ".local")):
+        return False
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    addrs = {info[4][0] for info in infos}
+    if not addrs:
+        return False
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            return False
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped  # unwrap ::ffff:169.254.169.254 and friends
+        if (not ip.is_global) or ip.is_private or ip.is_loopback or ip.is_link_local \
+                or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+def guarded_request(method: str, url: str, *, timeout: float, headers: dict | None = None,
+                    max_redirects: int = 4):
+    """httpx request that re-validates EVERY hop with is_public_http_url.
+
+    Auto-redirects are followed manually so a public URL can't 302-redirect us onto an internal
+    address (SSRF-via-redirect). Returns the final httpx.Response, or None if any target is
+    non-public, it redirects too many times, or the request errors. Replaces direct httpx.get/head
+    for all user-supplied URLs.
+    """
+    cur = url
+    try:
+        for _ in range(max_redirects + 1):
+            if not is_public_http_url(cur):
+                return None
+            r = httpx.request(method, cur, timeout=timeout, headers=headers, follow_redirects=False)
+            loc = r.headers.get("location")
+            if r.is_redirect and loc:
+                cur = str(r.url.join(loc))
+                continue
+            return r
+    except Exception:
+        return None
+    return None
 
 
 def find_links(text: str) -> list[str]:
@@ -116,7 +183,9 @@ def _image_part(url_or_uri: str) -> tuple[types.Part | None, str]:
     if url_or_uri.startswith("gs://"):
         return types.Part.from_uri(file_uri=url_or_uri, mime_type=mime_for_uri(url_or_uri)), ""
     try:
-        r = httpx.get(url_or_uri, timeout=20, follow_redirects=True, headers=BROWSER_HEADERS)
+        r = guarded_request("GET", url_or_uri, timeout=20, headers=BROWSER_HEADERS)
+        if r is None:  # blocked by the SSRF guard (non-public target) or too many redirects
+            return None, "error"
         if r.status_code in (401, 403, 429) or (
             r.status_code == 503 and ("cf-ray" in r.headers or "cloudflare" in (r.headers.get("server") or "").lower())
         ):
@@ -299,12 +368,9 @@ def study_link(url: str) -> dict:
     if _is_walled(url):  # don't probe login-walled hosts — study_page routes them via Search
         return study_page(url)
     # Quick content-type probe so a bare image URL (no extension) is still vision-analysed.
-    try:
-        head = httpx.head(url, timeout=8, follow_redirects=True, headers=BROWSER_HEADERS)
-        if _looks_like_image(url, head.headers.get("content-type", "")):
-            return study_image(url)
-    except Exception:
-        pass
+    head = guarded_request("HEAD", url, timeout=8, headers=BROWSER_HEADERS)
+    if head is not None and _looks_like_image(url, head.headers.get("content-type", "")):
+        return study_image(url)
     return study_page(url)
 
 

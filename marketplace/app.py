@@ -12,6 +12,7 @@ import hmac
 import io
 import json
 import os
+import re
 import threading
 import urllib.parse
 import uuid
@@ -66,6 +67,22 @@ def _bearer_ok(authorization: str) -> bool:
         return False
     presented = authorization[7:].strip() if authorization[:7].lower() == "bearer " else authorization.strip()
     return hmac.compare_digest(presented, MARKETPLACE_TOKEN)
+
+
+# Inbound payloads carry the marketplace's own callback bearer token (callback.bearerToken). We
+# persist payloads for contract debugging, so mask any secret-looking value BEFORE storage — the
+# live callback uses the token straight from the in-memory request, never the stored copy.
+_SECRET_KEY_RE = re.compile(r"(token|secret|bearer|authoriz|api[_-]?key|password|passwd|credential)", re.I)
+
+
+def _redact_secrets(obj):
+    """Deep copy with secret-looking string values masked (keys matching _SECRET_KEY_RE)."""
+    if isinstance(obj, dict):
+        return {k: ("***redacted***" if isinstance(v, str) and v and _SECRET_KEY_RE.search(str(k))
+                    else _redact_secrets(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_secrets(v) for v in obj]
+    return obj
 
 
 def _first(d: dict, keys: list[str]) -> str:
@@ -138,7 +155,11 @@ def _fetch_image_to_gcs(url: str) -> str | None:
     """Download a buyer-provided product image URL into our bucket; return its gs:// URI."""
     try:
         # Browser-like headers: CDNs/shops with bot protection 403 the default httpx user agent.
-        r = httpx.get(url, timeout=45, follow_redirects=True, headers=consult_engine.BROWSER_HEADERS)
+        # guarded_request re-validates every redirect hop against the SSRF allow-list (public IPs
+        # only), so a buyer-supplied URL can never make us fetch an internal/metadata address.
+        r = consult_engine.guarded_request("GET", url, timeout=45, headers=consult_engine.BROWSER_HEADERS)
+        if r is None:
+            return None
         r.raise_for_status()
         data, ext, ct = _normalize_product_image(r.content, r.headers.get("content-type") or "")
         return upload_bytes(data, f"inputs/mkt_{uuid.uuid4().hex}.{ext}", ct)
@@ -709,7 +730,9 @@ async def marketplace_webhook(
     if not isinstance(payload, dict):
         payload = {"_list": payload}
     # Persist the contract link (X-Docs) with the body so we can verify the exact schema later.
-    escrow.log_inbound({**payload, "_xdocs": x_docs} if x_docs else payload)
+    # Secrets (e.g. callback.bearerToken) are masked before storage — the live callback still uses
+    # the token from the in-memory `payload` below, not this redacted copy.
+    escrow.log_inbound(_redact_secrets({**payload, "_xdocs": x_docs} if x_docs else payload))
 
     event = str(payload.get("event") or "").lower()
 
@@ -798,9 +821,14 @@ async def marketplace_webhook(
 
 
 @app.get("/api/marketplace/inbound")
-def marketplace_inbound(token: str = ""):
-    """Token-gated: inspect the most recent captured payloads (to map the marketplace's contract)."""
-    if not _bearer_ok("Bearer " + token):
+def marketplace_inbound(authorization: str = Header(default="")):
+    """Token-gated inspector for the most recent captured payloads (to map the marketplace's contract).
+
+    Auth is the connection token via the `Authorization: Bearer <token>` header — NOT a query
+    param, which would leak the token into access logs, proxies and browser history. Stored
+    payloads already have secrets masked (see _redact_secrets), so this never returns live tokens.
+    """
+    if not _bearer_ok(authorization):
         raise HTTPException(401, "unauthorized")
     return {"recent": escrow.recent_inbound(5)}
 
@@ -955,6 +983,12 @@ def asset(uri: str, request: Request):
     if not uri.startswith("gs://"):
         raise HTTPException(400, "bad uri")
     bucket_name, _, blob_path = uri[5:].partition("/")
+    # Only ever proxy objects from OUR assets bucket. Without this, the endpoint is an unauthenticated
+    # confused-deputy: it would stream back ANY gs:// path the service account can read (other buckets
+    # in the project) using our credentials. Every legitimate proxy URL is an upload_bytes() URI in
+    # this bucket, so the restriction changes nothing for real traffic.
+    if bucket_name != settings.gcs_bucket or not blob_path:
+        raise HTTPException(403, "forbidden")
     blob = storage.Client(project=settings.project).bucket(bucket_name).blob(blob_path)
     try:
         blob.reload()  # populate size; raises NotFound if the object is missing
@@ -1369,14 +1403,16 @@ async function poll(){
     const cp = j.package.copy;
     if(cp){ $('#copy').classList.remove('hidden');
       let h = '<div class="font-medium text-sm">Marketing copy</div>';
-      if(typeof cp === 'string'){ h += '<pre class="whitespace-pre-wrap text-xs text-stone-600 mt-1">'+cp+'</pre>'; }
+      // Copy is LLM-generated from the buyer's brief, so escape every field before it touches the
+      // DOM — otherwise a crafted brief could yield HTML (e.g. <img onerror>) that runs in this console.
+      if(typeof cp === 'string'){ h += '<pre class="whitespace-pre-wrap text-xs text-stone-600 mt-1">'+escapeHtml(cp)+'</pre>'; }
       else {
-        if(cp.title) h += '<div class="mt-2 font-semibold text-stone-800">'+cp.title+'</div>';
-        if(cp.short) h += '<div class="text-sm text-stone-600">'+cp.short+'</div>';
-        if(cp.long) h += '<div class="mt-2 text-xs text-stone-600"><span class="text-stone-400">Long: </span>'+cp.long+'</div>';
-        if(cp.emotional) h += '<div class="mt-1 text-xs text-stone-600 italic">'+cp.emotional+'</div>';
-        if(Array.isArray(cp.bullets)) h += '<ul class="mt-1 text-xs text-stone-600 list-disc ml-4">'+cp.bullets.map(b=>'<li>'+b+'</li>').join('')+'</ul>';
-        if(Array.isArray(cp.reviews)) h += '<div class="mt-2 text-xs text-stone-600"><span class="text-stone-400">Reviews:</span>'+cp.reviews.map(r=>'<div class="mt-1">'+('★'.repeat(r.rating||5))+' '+(r.text||'')+' <span class="text-stone-400">— '+(r.author||'')+'</span></div>').join('')+'</div>';
+        if(cp.title) h += '<div class="mt-2 font-semibold text-stone-800">'+escapeHtml(cp.title)+'</div>';
+        if(cp.short) h += '<div class="text-sm text-stone-600">'+escapeHtml(cp.short)+'</div>';
+        if(cp.long) h += '<div class="mt-2 text-xs text-stone-600"><span class="text-stone-400">Long: </span>'+escapeHtml(cp.long)+'</div>';
+        if(cp.emotional) h += '<div class="mt-1 text-xs text-stone-600 italic">'+escapeHtml(cp.emotional)+'</div>';
+        if(Array.isArray(cp.bullets)) h += '<ul class="mt-1 text-xs text-stone-600 list-disc ml-4">'+cp.bullets.map(b=>'<li>'+escapeHtml(b)+'</li>').join('')+'</ul>';
+        if(Array.isArray(cp.reviews)) h += '<div class="mt-2 text-xs text-stone-600"><span class="text-stone-400">Reviews:</span>'+cp.reviews.map(r=>'<div class="mt-1">'+('★'.repeat(Math.max(0,Math.min(5,Number(r.rating)||5))))+' '+escapeHtml(r.text||'')+' <span class="text-stone-400">— '+escapeHtml(r.author||'')+'</span></div>').join('')+'</div>';
       }
       $('#copy').innerHTML = h;
     }
