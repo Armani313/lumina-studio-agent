@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from google.cloud import storage
 from google.cloud.exceptions import NotFound
 from google.genai import types
@@ -33,9 +33,10 @@ from lumina.pricing import (BASE_PRICE, FREE_REVISIONS, PER_CARD, PER_IMAGE, PER
                             default_spec, price_for_spec)
 from lumina.tools.delivery import mime_for_uri, upload_bytes
 
+from . import cloud_tasks
 from . import consult as consult_engine
 from . import escrow
-from .a2a_server import a2a_app
+from .a2a_server import a2a_app, build_agent_card
 
 
 @asynccontextmanager
@@ -48,6 +49,13 @@ async def _lifespan(_app):
 app = FastAPI(title="Lumina Studio Marketplace", lifespan=_lifespan)
 # Publish the agent over A2A on the same service; AgentCard at /a2a/.well-known/agent-card.json
 app.mount("/a2a", a2a_app)
+
+
+@app.get("/.well-known/agent-card.json")
+def agent_card() -> dict:
+    # A2A discovery at the canonical well-known URI on the domain root (the card's `url` points
+    # clients to the JSON-RPC endpoint under /a2a/).
+    return build_agent_card().model_dump(mode="json", exclude_none=True, by_alias=True)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -246,13 +254,34 @@ def _get_job_loop() -> asyncio.AbstractEventLoop:
     return _job_loop
 
 
+# Admission control: cap how many full agent pipelines run at once PER INSTANCE. A burst of orders
+# from several marketplaces then queues instead of thrashing the shared thread pool, RAM and the
+# Vertex quota. The image generator keeps its own finer cap (IMAGE_CONCURRENCY); this bounds whole
+# jobs. Created and awaited only on the job loop, so it binds to that loop. Parked jobs are just
+# cheap coroutine objects — heavy resources (Runner, sessions) are allocated only after a slot frees.
+_MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "4"))
+_job_sem: asyncio.Semaphore | None = None
+
+
+def _get_job_sem() -> asyncio.Semaphore:
+    global _job_sem
+    if _job_sem is None:
+        _job_sem = asyncio.Semaphore(_MAX_CONCURRENT_JOBS)
+    return _job_sem
+
+
 def _dispatch(coro) -> None:
     """Run a background agent job on the shared loop (keeps blocking work off the web loop).
 
+    Bounded by _job_sem so a flood of orders queues rather than overwhelming the instance.
     _run_job / _run_marketplace_job handle their own exceptions; the done-callback only fires for
     unexpected errors outside those guards, which we log instead of swallowing silently.
     """
-    fut = asyncio.run_coroutine_threadsafe(coro, _get_job_loop())
+    async def _gated() -> None:
+        async with _get_job_sem():
+            await coro
+
+    fut = asyncio.run_coroutine_threadsafe(_gated(), _get_job_loop())
 
     def _log_unhandled(f) -> None:
         try:
@@ -813,11 +842,71 @@ async def marketplace_webhook(
         # fresh=True on a new order resets the free-revision counter for this task.
         escrow.map_task(task_id, jid, fresh=not revision)
     live_url = f"{SERVICE_URL}/live/{jid}"
-    _dispatch(_run_marketplace_job(inputs, brief, image_url, brand_link, cb_url, cb_token,
-                                   delivery_id, jid=jid, revision_text=revision, prior_jid=prior_jid,
-                                   task_id=task_id, revisions_used=revisions_used))
+    job_args = {
+        "inputs": inputs, "brief": brief, "image_url": image_url, "brand_link": brand_link,
+        "cb_url": cb_url, "cb_token": cb_token, "delivery_id": str(delivery_id or ""),
+        "jid": jid, "revision_text": revision, "prior_jid": prior_jid,
+        "task_id": task_id, "revisions_used": revisions_used,
+    }
+    # Durability + cross-instance scaling: hand the order to Cloud Tasks (persisted, retried on a
+    # crash, globally rate-limited by the queue) when configured; otherwise run it in-process as
+    # before. The fallback means an order is never dropped if the queue is unset or unreachable.
+    if cloud_tasks.enqueue_order(job_args):
+        # Queued behind other orders during a burst: the worker only starts emitting stage events
+        # once a slot frees, so without this the live page would look stuck. Best-effort — the feed
+        # is cosmetic and must never break the accept path.
+        try:
+            escrow.add_event(
+                jid, "📋 Order queued — generation starts as soon as a studio slot is free",
+                kind="stage")
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        _dispatch(_run_marketplace_job(**job_args))
     return {"status": "accepted", "liveUrl": live_url,
             "note": f"Watch the agent think & work live: {live_url}"}
+
+
+@app.post("/internal/run-order")
+async def internal_run_order(request: Request, x_tasks_secret: str = Header(default="")):
+    """Worker endpoint: Cloud Tasks delivers a marketplace order here to be generated.
+
+    Public route (the queue can't carry GCP creds), gated by a shared-secret header. The heavy
+    generation runs INSIDE this request, so Cloud Run allocates CPU normally and a crash (no HTTP
+    response) makes Cloud Tasks redeliver — the durability the in-process background thread lacked.
+    Generation-level failures are reported to the buyer by _run_marketplace_job's own callback, so we
+    still return 200 for them; only an unhandled crash should trigger a retry.
+    """
+    if not cloud_tasks.secret_ok(x_tasks_secret):
+        raise HTTPException(401, "unauthorized")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "bad task body")
+    if not isinstance(body, dict) or not body.get("jid"):
+        raise HTTPException(400, "missing job args")
+    jid = str(body["jid"])
+    # Idempotency: a redelivery after the order already succeeded must not regenerate (and re-bill
+    # Veo). Terminal-success states are skipped; InProgress/Failed are allowed to run (crash retry).
+    job = escrow.get_job(jid)
+    if job and job.get("status") in ("Delivered", "Completed", "Released"):
+        print(f"[internal/run-order] jid={jid} already {job.get('status')}; skipping", flush=True)
+        return {"status": "already_done", "jid": jid}
+    await _run_marketplace_job(
+        inputs=body.get("inputs") or {},
+        brief=body.get("brief") or "",
+        image_url=body.get("image_url") or "",
+        brand_link=body.get("brand_link") or "",
+        cb_url=body.get("cb_url") or "",
+        cb_token=body.get("cb_token") or "",
+        delivery_id=body.get("delivery_id") or "",
+        jid=jid,
+        revision_text=body.get("revision_text") or "",
+        prior_jid=body.get("prior_jid") or "",
+        task_id=body.get("task_id") or "",
+        revisions_used=int(body.get("revisions_used") or 0),
+    )
+    return {"status": "ok", "jid": jid}
 
 
 @app.get("/api/marketplace/inbound")
@@ -1021,11 +1110,23 @@ def asset(uri: str, request: Request):
         }
         return Response(content=chunk, status_code=206, media_type=ctype, headers=headers)
 
-    data = blob.download_as_bytes()
-    return Response(
-        content=data, media_type=ctype,
-        headers={**base_headers, "Content-Length": str(len(data))},
-    )
+    # Stream the object instead of buffering the whole file in RAM: a multi-MB video fetched
+    # without a Range header (download managers, some clients) on a small instance could OOM and
+    # take every in-flight background job on that instance down with it.
+    chunk_size = 256 * 1024  # 256 KiB
+
+    def _stream():
+        with blob.open("rb") as fh:
+            while True:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
+    hdrs = dict(base_headers)
+    if size:
+        hdrs["Content-Length"] = str(size)
+    return StreamingResponse(_stream(), media_type=ctype, headers=hdrs)
 
 
 # --- "Agent thinking" narration ---------------------------------------------

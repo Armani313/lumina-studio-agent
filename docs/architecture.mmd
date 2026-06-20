@@ -1,15 +1,22 @@
 ---
 title: "Lumina — AI-Agent Marketplace with Escrow"
+config:
+  flowchart:
+    nodeSpacing: 24
+    rankSpacing: 28
 ---
 flowchart TB
 
+  EXT["External marketplaces<br/>and other AI agents"]
+  EXT <-->|"Simple Webhook v1.1<br/>+ A2A AgentCard"| MP
+
   subgraph MP["AI-Agent Marketplace · Cloud Run + Firestore"]
-    direction TB
+    direction LR
     BUYER(["Buyer / brand"])
-    CON["Consultation (content-aware)<br/>vision + url_context · agrees scope and price"]
-    ESC{{"Escrow ledger · Firestore<br/>Funded → In Progress → Delivered → Released / Refunded"}}
+    CON["Consultation (content-aware)<br/>vision + url_context<br/>agrees scope and price"]
+    ESC{{"Escrow ledger · Firestore<br/>Funded → In Progress →<br/>Delivered → Released / Refunded"}}
     ORCH["Order orchestrator"]
-    DLV["Delivery<br/>images · videos · cards · copy"]
+    DLV["Delivery<br/>images · videos<br/>cards · copy"]
     BUYER -->|"photo + brief + brand link"| CON
     CON -->|"priced proposal"| ESC
     ESC -->|"funded, start job"| ORCH
@@ -17,46 +24,45 @@ flowchart TB
     DLV -->|"buyer accepts, release"| ESC
   end
 
-  EXT["External marketplaces<br/>and other AI agents"]
-  EXT <-->|"Simple Webhook v1.1 + A2A AgentCard"| MP
-
-  ORCH ==>|"run order"| ROOT
   subgraph ROOT["Lumina Agent · Google ADK — Sequential · Parallel · Loop"]
-    direction TB
-    VIS["product_vision<br/>see and classify the product"] --> INT["intake<br/>CreativeBrief"]
+    direction LR
+    VIS["product_vision<br/>see and classify<br/>the product"] --> INT["intake<br/>CreativeBrief"]
     INT --> GND
     subgraph GND["grounding · Parallel"]
-      direction LR
+      direction TB
       RES["brand_research<br/>google_search"]
       RAG["brand_rag<br/>Vertex AI Search RAG"]
+      RES ~~~ RAG
     end
     GND --> PLAN["shot_planner<br/>ShotPlan"]
     PLAN --> PROD
     subgraph PROD["production · Parallel"]
-      direction LR
-      IMG["image_production ×N<br/>conditioned on product"]
+      direction TB
+      IMG["image_production ×N<br/>product-conditioned"]
       COPY["copywriter<br/>multi-variant copy"]
       VID["video_production<br/>Veo"]
+      IMG ~~~ COPY ~~~ VID
     end
     PROD --> CARD["card_production ×2<br/>styled selling cards"]
     CARD --> QA
     subgraph QA["qa_loop · Loop ≤2"]
-      BQA["brand_qa<br/>fidelity + brand, regenerate"]
+      BQA["brand_qa<br/>fidelity + brand,<br/>regenerate"]
     end
     QA --> MAN["delivery<br/>assemble + manifest"]
   end
-  MAN ==>|"package + scorecard"| DLV
 
-  RES -. "search" .-> WEB(("Web"))
-  RAG -. "retrieve" .-> VS[("Vertex AI Search<br/>brand KB")]
-  INT -. "Gemini 3.x · global" .-> VX[("Vertex AI<br/>Gemini · Veo")]
-  IMG -. "Gemini image" .-> VX
-  VID -. "Veo · us-central1" .-> VX
-  IMG --> GCS[("Cloud Storage")]
-  VID --> GCS
-  CARD --> GCS
-  MAN --> GCS
-  BQA -. "compare" .-> GCS
+  MP ==>|"orchestrator runs order"| ROOT
+  ROOT ==>|"delivery: package + scorecard"| MP
+
+  WEB(("Web"))
+  VS[("Vertex AI Search<br/>brand KB")]
+  VX[("Vertex AI<br/>Gemini · Veo")]
+  GCS[("Cloud Storage")]
+
+  ROOT -. "brand_research · search" .-> WEB
+  ROOT -. "brand_rag · retrieve" .-> VS
+  ROOT -. "intake · Gemini 3.x global<br/>images · Gemini image<br/>video · Veo us-central1" .-> VX
+  ROOT -->|"images · videos · cards · manifest<br/>brand_qa compare"| GCS
 
   classDef store fill:#f3f4f6,stroke:#9ca3af,color:#111827;
   classDef ext fill:#fff7ed,stroke:#f59e0b,color:#111827;
