@@ -29,4 +29,5 @@ outputs/
 
 # --- Committed assets (exceptions to the *.png rule above) ---
 !assets/sample_product.png
+!assets/grounded_4x5.png
 !docs/architecture.png

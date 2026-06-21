@@ -15,7 +15,7 @@ BASE = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("LUMINA_BASE", "http://1
 _TOKEN = os.getenv("AUTH_TOKEN", "")
 HEADERS = {"Authorization": f"Bearer {_TOKEN}"} if _TOKEN else {}
 
-PHOTO = os.getenv("PHOTO", "outputs/grounded_4x5.png")
+PHOTO = os.getenv("PHOTO", "assets/grounded_4x5.png")
 DESCRIPTION = os.getenv("BRIEF") or (
     "Brand: 'Aurelia' — minimalist premium skincare; calm, clinical tone. Product (see uploaded "
     "photo): 'Aurelia Glow Serum', a vitamin-C serum in a frosted glass dropper bottle. Features: "

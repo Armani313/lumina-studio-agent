@@ -22,7 +22,7 @@ from lumina.tools.delivery import mime_for_uri, public_https_url, upload_bytes
 
 # Stand-in product photo (a previously generated clean Aurelia bottle). Replace with a real
 # product photo path as the first CLI arg.
-PRODUCT_PHOTO = sys.argv[1] if len(sys.argv) > 1 else "outputs/grounded_4x5.png"
+PRODUCT_PHOTO = sys.argv[1] if len(sys.argv) > 1 else "assets/grounded_4x5.png"
 
 DESCRIPTION = os.getenv("BRIEF") or (
     "Brand: 'Aurelia' — minimalist premium skincare; calm, clinical tone; earthy neutral palette. "
