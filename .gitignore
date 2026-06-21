@@ -1,14 +1,32 @@
+# --- Python ---
 .venv/
 __pycache__/
 *.pyc
 *.egg-info/
+.pytest_cache/
+
+# --- Secrets / local env ---
+# NOTE: gcp.env IS committed on purpose — it's a non-secret config reference (IDs only).
 .env
-.claude/
+.env.*
+
+# --- Generated outputs / scratch ---
 outputs/
+
+# --- Generated media (only the committed assets in the exceptions below are kept) ---
 *.png
 *.mp4
-.DS_Store
 
-# committed assets (exceptions to the *.png rule above)
+# --- OS / editor junk ---
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# --- Local agent tooling ---
+.claude/
+
+# --- Committed assets (exceptions to the *.png rule above) ---
 !assets/sample_product.png
 !docs/architecture.png
