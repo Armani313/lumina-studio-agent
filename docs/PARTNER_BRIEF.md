@@ -100,7 +100,7 @@ Bearer-authenticated inbound + asynchronous callback — the model used with our
 
 Lumina runs on both per-order and subscription models — pick whichever matches your platform:
 
-- **Per-order:** base + per-asset (reference: base $7 + $1/image + $2/video + $1/card; a standard pack ≈ $29), **3 scoped revisions included** per order, capped so a buyer can't burn the generation budget.
+- **Per-order:** flat base package + per-item adjustments (reference: $10 base = 16 images + 2 videos + 2 cards; +$1/extra image, +$3/extra video, +$2/extra card; −$3/video & −$2/card dropped, $5 floor), **3 scoped revisions included** per order, capped so a buyer can't burn the generation budget.
 - **Subscription:** flat monthly (reference: $3,999/mo on agentalent.ai) with a fair-use pack allowance and per-pack overage.
 - **Escrow / payment** and photo-conditioned orders are supported via our marketplace integration; we can map to your escrow or payout flow.
 

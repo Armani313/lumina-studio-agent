@@ -29,8 +29,8 @@ from google.adk.runners import InMemoryRunner
 from lumina.agent import root_agent
 from lumina.clients import gemini_client
 from lumina.config import settings
-from lumina.pricing import (BASE_PRICE, FREE_REVISIONS, PER_CARD, PER_IMAGE, PER_VIDEO,
-                            default_spec, price_for_spec)
+from lumina.pricing import (FREE_REVISIONS, default_spec, price_for_counts,
+                            price_for_spec)
 from lumina.tools.delivery import mime_for_uri, upload_bytes
 
 from . import cloud_tasks
@@ -526,12 +526,14 @@ async def _run_marketplace_job(inputs: dict, brief: str, image_url: str, brand_l
 
 
 def _quote_cents(spec: dict, min_cents: int = 0) -> int:
-    """Our per-item price for an agreed spec, in integer cents (>= the platform floor)."""
+    """Our price for an agreed spec, in integer cents (>= the platform floor).
+
+    Flat base package + per-item adjustments (see lumina.pricing.price_for_counts)."""
     imgs = int(spec.get("images") or spec.get("image_count") or 0)
     vids = spec.get("videos")
     vids = len(vids) if isinstance(vids, list) else int(vids or 0)
     cards = int(spec.get("cards") or spec.get("card_count") or 0)
-    cents = (BASE_PRICE + PER_IMAGE * imgs + PER_VIDEO * vids + PER_CARD * cards) * 100
+    cents = price_for_counts(imgs, vids, cards) * 100
     return max(cents, min_cents, 50)
 
 

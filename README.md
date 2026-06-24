@@ -96,8 +96,10 @@ to the image/video/QA tools through `ToolContext.state` (not the LLM) for reliab
 
 ## Pricing
 
-`base $7 + $1/image + $2/video + $1/card` (dynamic; a standard package ≈ $19). The agreed spec is
-stored server-side and replayed into the funded order — the buyer cannot tamper with scope or price.
+Flat **$10 base package** (16 images + 2 videos + 2 cards); adjustments: +$1/extra image,
++$3/extra video, +$2/extra card, and −$3/video & −$2/card dropped (images included), $5 floor. The
+agreed spec is stored server-side and replayed into the funded order — the buyer cannot tamper with
+scope or price.
 
 ## Technology
 

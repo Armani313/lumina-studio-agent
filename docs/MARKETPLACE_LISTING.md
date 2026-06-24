@@ -4,8 +4,8 @@ English only (marketplace listing language). The Detailed Description field supp
 **bold**, `## Title` headings, `- item` / `1. item` lists, `[text](url)` links; a blank
 line starts a new paragraph.
 
-Numbers must stay in sync with `lumina/pricing.py` (BASE_PRICE/PER_IMAGE/PER_VIDEO/PER_CARD,
-FREE_REVISIONS) and `default_spec()` (16 images + 2 videos + 2 cards → $29).
+Numbers must stay in sync with `lumina/pricing.py` (BASE_PACKAGE_PRICE / ADD_IMAGE / VIDEO_DELTA /
+CARD_DELTA / PRICE_FLOOR, FREE_REVISIONS) and `default_spec()` (16 images + 2 videos + 2 cards → $10).
 
 No external links on purpose: off-platform links in a listing read as spammy and lead buyers
 away; the live-view link is delivered per order instead.
@@ -23,7 +23,7 @@ away; the live-view link is delivered per order instead.
 
 Lumina is an autonomous AI product-content studio. Send a single photo of your product and a couple of lines about where you sell — it researches your brand, plans the shoot and delivers a complete, ready-to-publish package: photos, videos, product cards and copy, typically within 15–40 minutes.
 
-## What You Get — Standard Package ($29)
+## What You Get — Base Package ($10)
 
 - 📸 **16 photorealistic product images** — hero shots, macro details, lifestyle scenes, flat-lays and clean e-commerce frames, in the right aspect ratios for your platforms (4:5, 1:1, 9:16, 16:9)
 - 🎬 **2 short videos** — 360° spin, voiceover ad, UGC-style or macro, sized for Reels, TikTok or Amazon
@@ -46,12 +46,11 @@ Every order includes a public live link: watch the agent think, plan, generate a
 
 ## Transparent Pricing
 
-- Base — **$7**
-- **$1** per image
-- **$2** per video
-- **$1** per card
+- **$10 base package** — 16 images + 2 videos + 2 cards + full marketing copy
+- Want more? **+$1** per extra image, **+$3** per extra video, **+$2** per extra card
+- Want less? **−$3** per video and **−$2** per card you drop (all 16 images stay included), **$5** minimum
 
-The standard package above comes to **$29**; just 8 images and no video is **$16**. You agree the exact scope and price in chat before anything is funded, and payment sits in escrow until you accept the delivery.
+The base package above is **$10**; add a third video and it's **$13**; drop to 1 video and no cards is **$5**. You agree the exact scope and price in chat before anything is funded, and payment sits in escrow until you accept the delivery.
 
 ## Revisions Included
 
